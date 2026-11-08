@@ -121,7 +121,45 @@ Notas técnicas, decisiones de diseño y conceptos de bajo nivel aprendidos dura
 
 ### 10. Repositorio y convenciones
 * **`.gitignore` mínimo:** `build/` (CMake genera todo dentro: objetos, `CMakeCache.txt`, `compile_commands.json`, `Testing/`...) y `*:Zone.Identifier` (metadatos que crea Windows al copiar archivos a WSL). Se añaden reglas solo cuando aparece algo real en `git status`.
-* **`.gitattributes`:** controla cómo trata git los archivos. `* text=auto eol=lf` normaliza saltos de línea; `*.torrent binary` evita que git altere los `.torrent` (contienen hashes SHA-1 en bruto). No imprescindible trabajando solo desde WSL.
+* **`.gitattributes`:** controla cómo trata git los archivos. `* text=auto eol=lf` normaliza saltos de línea; `*.torrent binary` evita que git altere los `.torrent` (contienen hashes SHA-1 en bruto). No imprescindible trabajando solo desde WSL. *(Detalle completo en la entrada del 2026-11-08.)*
 * **Git no versiona carpetas vacías:** `include/` y `tests/` no aparecen en el remoto hasta que tengan un archivo (o un `.gitkeep`).
 * **Idioma:** código, comentarios, commits y README en inglés (estándar de la industria, portfolio). La bitácora puede quedarse en español.
 * **Comentarios:** explicar el *porqué* (decisiones no obvias), no el *qué* (eso está en la documentación y en esta bitácora).
+
+---
+
+## [2026-11-08] `.gitattributes`: saltos de línea y archivos binarios
+
+### 1. Qué es
+* `.gitignore` dice a git qué archivos **no guardar**; `.gitattributes` dice **cómo tratar** los que sí guarda. Va en la raíz del repo y se versiona como cualquier archivo.
+* **Problema de fondo:** Linux termina las líneas con `\n` (LF) y Windows con `\r\n` (CRLF). Git puede convertir entre ambos; en texto es inofensivo, pero en un archivo binario corrompe los bytes.
+
+### 2. Configuración del proyecto
+```gitattributes
+* text=auto eol=lf
+*.torrent binary
+```
+
+| Línea | Afecta a | Qué hace |
+|---|---|---|
+| `* text=auto` | todos | detecta si es texto y, si lo es, lo guarda en el repo con LF |
+| `eol=lf` | los de texto | los escribe en disco (checkout/clone) con LF |
+| `*.torrent binary` | los `.torrent` | no se tocan: sin conversión, sin diff, sin merge |
+
+* **`text=auto`:** git decide por archivo si es texto o binario (heurística: si hay un byte nulo `\0` al principio, es binario). Los de texto se **normalizan** a LF al hacer commit, aunque en disco tuvieran CRLF. Los binarios no se tocan.
+* **`eol=lf`:** `text` controla cómo se **guarda** en el repo; `eol` controla cómo se **saca** al directorio de trabajo. Con `eol=lf`, los textos salen con LF en cualquier sistema, sin depender de `core.autocrlf` de cada máquina (p. ej. scripts `.sh` con CRLF no se ejecutan en Linux).
+* **`binary`:** atajo (macro) de tres atributos:
+  * `-text`: nunca convertir saltos de línea. Protege los hashes SHA-1 en bruto del `.torrent`: si uno de sus bytes es `0x0A` (`\n`) y git lo convierte, el archivo se corrompe y el parser falla sin motivo aparente.
+  * `-diff`: `git diff` muestra solo `Binary files differ` en lugar de basura.
+  * `-merge`: en un conflicto no se mezclan líneas (rompería el archivo); se elige una versión entera.
+
+### 3. El orden importa
+* Si varias líneas afectan al mismo archivo, **gana la última** (como en CSS). Primero la regla general (`*`), después las excepciones (`*.torrent`).
+* Con el orden invertido, `* text=auto` (abajo) pisaba el `-text` de `binary` y el `.torrent` quedaba como `text: auto`: dependería de que la heurística acertase, que es justo lo que `binary` pretende evitar.
+
+### 4. Verificación
+```bash
+git check-attr -a tests/data/debian-13.7.0-amd64-netinst.iso.torrent
+```
+Resultado correcto: `binary: set`, `diff: unset`, `merge: unset`, `text: unset`. El `eol: lf` que aparece es irrelevante: `eol` solo se aplica a archivos de texto.
+* Salida vacía → el `.gitattributes` no existe, está vacío o no se ha guardado.
