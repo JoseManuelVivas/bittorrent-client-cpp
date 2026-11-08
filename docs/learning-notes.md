@@ -328,3 +328,121 @@ target_link_libraries(bittorrent_client PRIVATE btcore btclient_options)
   * Convención: comentar la llave de cierre, `}  // namespace btclient`, porque el bloque suele ocupar todo el archivo.
   * **Nunca `using namespace` en un `.h`:** se aplicaría a todo archivo que lo incluya y reintroduce los choques. En un `.cpp` es aceptable (aunque escribir siempre `std::` es lo más claro).
   * Un namespace por proyecto suele bastar; si crece, se pueden anidar con la sintaxis de C++17: `namespace btclient::bencode { ... }`.
+
+### 9. Includes: la ruta empieza *dentro* de `include/`
+* `target_include_directories(btcore PUBLIC .../include)` → el compilador busca **dentro** de `include/`. La ruta del `#include` se pega detrás:
+  * `#include "include/btclient/bencode.h"` → busca `.../include/include/btclient/bencode.h` ✗
+  * `#include "btclient/bencode.h"` → `.../include/btclient/bencode.h` ✓
+* **VS Code no lo marcó como error:** la extensión C/C++ de Microsoft busca por defecto en todo el proyecto (`${workspaceFolder}/**`) y encuentra el archivo con cualquier ruta razonable; el compilador solo busca donde dice CMake. Para que el editor vea lo mismo que el compilador: extensión **CMake Tools** como proveedor de configuración (`"C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"`).
+
+---
+
+## [2026-11-08] Diseño del tipo `Value`: `std::variant` y tipos recursivos
+
+### 1. Qué es un "valor bencode"
+* Cualquiera de los cuatro tipos: entero, string, lista o diccionario. Las listas y diccionarios **contienen otros valores** → estructura **recursiva** (un árbol).
+* **El fichero entero es un único valor** (un diccionario), y cada nodo de dentro también lo es:
+  ```
+  diccionario                                  ← el fichero entero (1 valor)
+  ├── "announce"      → string
+  ├── "creation date" → entero
+  ├── "url-list"      → lista
+  │                     ├── string
+  │                     └── string
+  └── "info"          → diccionario
+                        ├── "length"       → entero
+                        ├── "name"         → string
+                        ├── "piece length" → entero
+                        └── "pieces"       → string (binario)
+  ```
+* El tipo `Value` no representa "el fichero": representa **cualquier nodo** del árbol. El decoder devuelve **un** `Value`, la raíz.
+* Las claves de un diccionario bencode son siempre strings; solo los valores son recursivos.
+
+### 2. Tipo suma (*tagged union*)
+* `Value` no es "un diccionario de algo genérico": es un tipo que es **exactamente una** de varias alternativas en cada momento:
+  ```
+  Value = entero | string | lista de Value | diccionario de (string → Value)
+  ```
+* No es "genérico" en el sentido de plantillas (`template<T>`); es un **tipo suma** o *tagged union*. Otros lenguajes lo traen de serie (los `enum` de Rust).
+
+### 3. `union` vs `std::variant`
+* **`union` (C/C++ clásico):** reserva memoria para el miembro más grande y todos comparten esos bytes. Problemas:
+  * **No sabe qué contiene:** hay que llevar la cuenta a mano con un *tag*. Leer el miembro equivocado es *undefined behavior*.
+  * **No gestiona constructores ni destructores:** con `std::string`, `std::vector` o `std::map` habría que usar *placement new* y llamar a los destructores a mano → fugas, *double free*.
+* **`std::variant` (C++17, `<variant>`):** *tagged union* segura.
+  * Sabe en todo momento qué alternativa contiene.
+  * Construye y destruye correctamente lo que lleva dentro.
+  * Leer la alternativa equivocada se detecta (excepción o puntero nulo) en vez de devolver basura.
+
+### 4. API básica de `std::variant`
+| Función | Qué hace |
+|---|---|
+| `v.data = 42;` | asigna; `variant` elige la alternativa que encaja |
+| `std::holds_alternative<T>(v.data)` | `true` si contiene la alternativa `T` |
+| `std::get<T>(v.data)` | devuelve la alternativa `T`; si no es esa, lanza `std::bad_variant_access` |
+| `std::get_if<T>(&v.data)` | puntero a la alternativa `T`, o `nullptr` si no es esa (sin excepciones) |
+| `std::visit(f, v.data)` | ejecuta `f` con la alternativa que haya; ideal para el printer |
+
+* El tipo entre `< >` debe ser el **exacto** de la alternativa (si se declaró `std::int64_t`, se pregunta por `std::int64_t`).
+* Experimento: pedir `std::get<std::string>` a un `Value` con un entero → termina con `std::bad_variant_access`. Esa es la seguridad que una `union` no da.
+
+### 5. Sintaxis y nombres
+* Una variable se declara `TIPO nombre;`, y los `< >` forman parte del **tipo**:
+  * ✗ `std::variant test<int, std::string>;`
+  * ✓ `std::variant<int, std::string> data;`
+* **Tipo vs miembro:** el `struct` es el tipo (`Value`, en `PascalCase`); el miembro es la variable de dentro (`data`, en `snake_case`). Evitar `value.value`: `v.data` se lee mejor.
+* **Enteros de 64 bits:** `std::int64_t` (`<cstdint>`). Un `int` de 32 bits (máx. ~2.100 millones) no basta para el `length` de un torrent de varios GB.
+* **Incluir siempre lo que se usa:** `<string>` aunque `<variant>` lo incluya por dentro en GCC; no está garantizado.
+
+### 6. Tipos incompletos y recursividad
+* **Un tipo no puede contenerse a sí mismo por valor:** su tamaño sería infinito (`Caja` = entero + `Caja` = entero + entero + `Caja`...).
+* **Incomplete type:** mientras el compilador lee la definición de un tipo y no ha llegado al final, sabe que existe pero no cuánto ocupa. Con él se pueden tener **punteros y referencias** (tamaño fijo, 8 bytes en 64 bits), pero no objetos por valor.
+* **Salida: indirección.** Un `std::vector` no guarda sus elementos dentro de sí: ocupa siempre lo mismo (puntero al heap + tamaño + capacidad). Por eso un `Value` **sí** puede contener un `std::vector<Value>`.
+* **Alias vs `struct`:** `using Value = std::variant<..., std::vector<Value>>;` no compila: un alias no existe hasta que termina su línea. Dentro de las llaves de un `struct`, en cambio, su nombre ya existe (aunque incompleto). Por eso `Value` es un `struct` que envuelve el `variant`.
+* **Declaración adelantada** (`struct Value;`): anuncia el nombre antes de definirlo. Dentro del propio `struct` no hace falta; sí cuando otro código necesita nombrar el tipo antes de su definición.
+* **Patrón** (ejemplo análogo, sistema de archivos):
+  ```cpp
+  struct Entry;
+  struct Entry {
+      std::variant<std::string, std::vector<Entry>> content;
+  };
+  ```
+* **Contenedores y tipos incompletos:**
+  * `std::vector`, `std::list`, `std::forward_list`: **garantizado** desde C++17.
+  * `std::map`: **no garantizado** por el estándar (funciona con libstdc++/GCC en la práctica).
+
+### 7. Decisión pendiente: representación del diccionario
+| Opción | A favor | En contra |
+|---|---|---|
+| `std::map<std::string, Value>` | natural; claves ordenadas automáticamente; búsqueda rápida | el estándar no garantiza que funcione con tipo incompleto |
+| `std::vector<std::pair<std::string, Value>>` | garantizado; conserva el orden del fichero (en bencode válido ya viene ordenado) | buscar una clave es recorrerlo (irrelevante con 5-10 claves) |
+* **Info hash (a futuro):** es el SHA-1 del diccionario `info` **exactamente como venía en el fichero**. Cualquier alteración (orden de claves, número reescrito) cambia el hash. Idea: que el decoder recuerde en qué posición del buffer empezaba y terminaba `info`, en lugar de re-codificarlo como hace la guía de Go.
+
+### 8. Usar el tipo
+* Acceso sin copiar: `const auto& elementos = std::get<std::vector<Value>>(raiz.data);`. `const auto&` es una **referencia constante**: accede al vector dentro de `raiz` sin copiarlo (sin `&` se copiaría el vector entero).
+* Recorrido con `for` de rango: `for (const auto& elem : elementos) { ... }`.
+* `std::boolalpha` en el `cout` imprime `true`/`false` en vez de `1`/`0`.
+
+### 9. Errores encontrados por el camino
+* **`;` antes del `else`:** toda sentencia acaba en `;`, también en un `if` sin llaves. Usar **llaves siempre** en ambas ramas evita estos despistes.
+* **Parámetros sin usar** (`argc`, `argv` al comentar su uso): `-Wextra` avisa y `-Werror` lo convierte en error. Soluciones: `int main()` o el atributo `[[maybe_unused]]` delante de cada parámetro.
+* **`};` al cerrar un `namespace`:** sobra. `struct` y `class` llevan `;` tras la llave; `namespace` no. `-Wpedantic` lo detecta como "extra ';'".
+
+### 10. CMake: configurar y compilar
+* **Configurar** (`cmake -B build`): lee el `CMakeLists.txt`, detecta el compilador y **genera** en `build/` los archivos de la herramienta real (en Linux, `Makefile`s). No compila.
+* **Compilar** (`cmake --build build`): ejecuta esa herramienta (equivale a `cd build && make`). `--build` es la opción ("compila") y `build` su argumento (la carpeta; el nombre coincide por convención).
+* **Incremental:** solo recompila lo que ha cambiado (y los `.cpp` que incluyen un header modificado).
+* Si cambia el `CMakeLists.txt`, `cmake --build` reconfigura solo. Reconfigurar a mano solo al borrar `build/` o cambiar opciones (`-D...`).
+
+| Comando | Qué hace |
+|---|---|
+| `cmake --build build --verbose` | muestra el comando `g++` exacto |
+| `cmake --build build -j` | compila en paralelo |
+| `cmake --build build --target btcore` | solo ese target |
+| `cmake --build build --clean-first` | recompila todo desde cero |
+
+### 11. Estado y siguientes pasos
+1. ✅ `variant` con entero (`std::int64_t`) y string; probado en `main.cpp`.
+2. ⬜ Añadir la lista (`std::vector<Value>`) y probarla: crear `[42, "hola"]`, recorrerla e imprimir el tipo de cada elemento.
+3. ⬜ Añadir el diccionario (decidir la representación, sección 7).
+4. ⬜ Empezar el decoder.
