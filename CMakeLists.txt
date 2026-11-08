@@ -17,15 +17,13 @@ endif()
 option(WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(ENABLE_SANITIZERS  "Enable ASan and UBSan in Debug builds" ON)
 
-add_executable(bittorrent_client
-    src/main.cpp
-)
+# ----------------------------------------------------------------------------
+# Shared build settings: every project target links this, so warnings and
+# sanitizers are defined once and applied everywhere.
+# ----------------------------------------------------------------------------
+add_library(btclient_options INTERFACE)
 
-target_include_directories(bittorrent_client PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-
-target_compile_options(bittorrent_client PRIVATE
+target_compile_options(btclient_options INTERFACE
     -Wall
     -Wextra
     -Wpedantic
@@ -35,7 +33,7 @@ target_compile_options(bittorrent_client PRIVATE
 )
 
 if(WARNINGS_AS_ERRORS)
-    target_compile_options(bittorrent_client PRIVATE -Werror)
+    target_compile_options(btclient_options INTERFACE -Werror)
 endif()
 
 # The client parses untrusted binary data from the network, so memory and
@@ -43,6 +41,32 @@ endif()
 if(ENABLE_SANITIZERS)
     set(SANITIZER_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer)
     # Needed at both compile and link time (links the sanitizer runtime)
-    target_compile_options(bittorrent_client PRIVATE "$<$<CONFIG:Debug>:${SANITIZER_FLAGS}>")
-    target_link_options(bittorrent_client PRIVATE "$<$<CONFIG:Debug>:${SANITIZER_FLAGS}>")
+    target_compile_options(btclient_options INTERFACE "$<$<CONFIG:Debug>:${SANITIZER_FLAGS}>")
+    target_link_options(btclient_options INTERFACE "$<$<CONFIG:Debug>:${SANITIZER_FLAGS}>")
 endif()
+
+# ----------------------------------------------------------------------------
+# Core library: protocol logic, reused by the client, tools and tests
+# ----------------------------------------------------------------------------
+add_library(btcore STATIC
+    src/bencode.cpp
+    src/bencode_printer.cpp
+)
+
+target_include_directories(btcore PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(btcore PRIVATE btclient_options)
+
+# ----------------------------------------------------------------------------
+# Client executable
+# ----------------------------------------------------------------------------
+add_executable(bittorrent_client
+    src/main.cpp
+)
+
+target_link_libraries(bittorrent_client PRIVATE
+    btcore
+    btclient_options
+)
