@@ -443,6 +443,123 @@ target_link_libraries(bittorrent_client PRIVATE btcore btclient_options)
 
 ### 11. Estado y siguientes pasos
 1. ✅ `variant` con entero (`std::int64_t`) y string; probado en `main.cpp`.
-2. ⬜ Añadir la lista (`std::vector<Value>`) y probarla: crear `[42, "hola"]`, recorrerla e imprimir el tipo de cada elemento.
-3. ⬜ Añadir el diccionario (decidir la representación, sección 7).
+2. ✅ Añadir la lista (`std::vector<Value>`) y probarla: crear `[42, "hola"]`, recorrerla e imprimir el tipo de cada elemento.
+3. ✅ Añadir el diccionario (decidir la representación, sección 7). *(Ver entrada siguiente.)*
 4. ⬜ Empezar el decoder.
+
+---
+
+## [2026-11-08] Diccionario, `find()`, propiedad de la memoria y `string_view`
+
+### 1. Representación del diccionario
+* **Decisión:** `std::vector<std::pair<std::string, Value>>` en lugar de `std::map` (garantizado con tipos incompletos y conserva el orden del fichero; ver sección 7 de la entrada anterior).
+* **`std::pair` mejor que `std::tuple`** (`<utility>`): para dos elementos es lo idiomático; `.first` (clave) y `.second` (valor) se leen mejor que `std::get<0>`/`std::get<1>`. Los elementos de un `std::map` también son `std::pair`. `std::tuple` es para tres o más elementos.
+* **Alias con `using`** (`List`, `Dict`): evitan repetir tipos largos en cada `std::get<...>` / `holds_alternative<...>`.
+* **Aquí sí hace falta la declaración adelantada:** los alias mencionan `Value` y deben declararse **antes** del `struct` para usarlos dentro del `variant`. `struct Value;` anuncia el nombre; los alias se definen con el tipo aún incompleto (el vector lo permite); después se define el `struct`.
+  ```cpp
+  struct Value;
+  using List = std::vector<Value>;
+  using Dict = std::vector<std::pair<std::string, Value>>;
+  struct Value { std::variant<std::int64_t, std::string, List, Dict> data; };
+  ```
+* **Nombres:** `List`/`Dict` en `PascalCase` como `Value` (coherencia). `list` en minúscula además se confunde con `std::list`.
+* **IntelliSense vs compilador:** el subrayado rojo de VS Code viene del analizador propio de la extensión C/C++, que con tipos incompletos en plantillas a veces se queja de código que GCC acepta. **Manda el compilador:** si `cmake --build build` compila, el código es válido.
+* **Pendiente para el decoder:** la especificación exige claves **únicas y ordenadas**. Un vector no lo impide; se valida al decodificar.
+
+### 2. Diseño de `find()`
+```cpp
+[[nodiscard]] const Value* find(const Value& dictionary, std::string_view key);
+```
+* **Parámetro por referencia, retorno por puntero:**
+  * Referencia → argumento **obligatorio** (no puede ser nula; no hay que comprobar `nullptr`).
+  * Puntero → "quizá no hay nada" es un resultado válido (`nullptr` si no existe la clave o si `dictionary` no es un `Dict`).
+* **Orden:** primero el objeto sobre el que se opera, luego lo que se busca (`find(dictionary, key)`).
+* **Nombre:** `find` es la convención de la librería estándar para "busca y dime dónde está o nada" (`std::find`, `std::map::find`, `std::string::find`). `std::search` es otra cosa (buscar una *secuencia* dentro de otra).
+* **Clave como `std::string_view`:** permite llamar con `"announce"`, con un `std::string` o con un trozo de buffer sin crear copias. `std::string == std::string_view` se compara directamente.
+* **Comprobar el tipo sin excepciones:** `std::get_if<Dict>(&dictionary.data)` devuelve un puntero al `Dict` o `nullptr`.
+* **"No encontrado" es un caso normal**, no un error: en un `.torrent` hay claves obligatorias (`info`) y opcionales (`comment`).
+* **Trampa:** en el `for` de rango, `auto` sin `&` copia cada elemento; devolver la dirección de esa copia deja un *dangling pointer* (ASan: *stack-use-after-scope*). Usar `const auto&`.
+* **Declaración en `bencode.h`, definición en `bencode.cpp`**, ambas dentro de `namespace btclient`. Declarada pero sin definir compila mientras nadie la llame; si se usa → error de enlazado *undefined reference to `btclient::find`*.
+
+### 3. Propiedad de la memoria: ¿smart pointer o puntero normal?
+* **Los smart pointers expresan propiedad** (quién libera la memoria). `find` no transfiere propiedad: el dueño de cada `Value` es el vector que lo contiene; `find` solo "señala".
+  * `std::unique_ptr` → "soy el único dueño y libero al destruirme". Liberaría un elemento que sigue perteneciendo al vector → **double free**.
+  * `std::shared_ptr` → propiedad compartida con contador. Obligaría a guardar `shared_ptr<Value>` en el diccionario: rediseño, contador atómico y una reserva de memoria por nodo, solo para buscar.
+* **Convención (C++ Core Guidelines):** smart pointer = **posee**; puntero normal `T*` = **observa sin poseer** (y puede ser `nullptr`). Mismo patrón que los iteradores de `std::map::find`.
+* **La vida útil se garantiza por diseño:** el árbol de `Value`s debe vivir más que los punteros obtenidos de él (natural: se decodifica una vez y luego se consulta). Si se rompe la regla, ASan avisa (`heap-use-after-free`).
+* **Invalidación por modificación:** si se añade un elemento a un `std::vector` sin capacidad libre, **realoja** todos sus elementos y los punteros/referencias a ellos quedan colgando aunque el vector siga vivo. Por eso el contrato de `find` dice *"while it is alive and unmodified"*.
+
+### 4. `std::string_view` en profundidad
+* **Analogía:** `std::string` es **tener el libro** (tuyo; si lo tiras, desaparece). `std::string_view` es **un marcapáginas con nota** ("libro de Juan, página 40, líneas 3-7"): barato, pero si Juan tira el libro, apunta a nada.
+* **En memoria:** `{ puntero al primer carácter, longitud }` → 16 bytes, sin reservar memoria ni copiar.
+  ```
+  std::string s = "announce";      // s es dueño de los caracteres (heap)
+  std::string_view v1 = s;         // { ptr→'a', 8 }
+  std::string_view v2 = v1.substr(4); // { ptr→'u', 4 } = "unce", sin copiar
+  ```
+  `substr` en un `string_view` solo mueve el puntero y la longitud; en un `std::string` crea una copia nueva.
+* **Usos en el proyecto:**
+  * **Parámetros de solo lectura:** acepta literales, `std::string` y trozos de buffer sin copias. Con `const std::string&`, llamar con `"announce"` crearía un `std::string` temporal (y una reserva de memoria).
+  * **Parser:** cada string bencode ya está en el buffer del fichero; la vista lo señala sin copiarlo.
+* **Trampas:**
+  1. **Dangling:** que el dueño muera antes que la vista (devolver una vista a un `std::string` local, o crearla desde un temporal). ASan: `stack-use-after-return` / `heap-use-after-free`. **Regla:** una vista nunca debe vivir más que el texto al que apunta. Como parámetro es seguro (quien llama mantiene el texto vivo durante la llamada); guardarla o devolverla exige pensar quién es el dueño.
+  2. **No termina en `\0`:** no pasar `v.data()` a funciones de C (`printf("%s")`, `fopen`). `std::cout << v` sí respeta la longitud.
+
+| | `std::string` | `std::string_view` |
+|---|---|---|
+| ¿Dueño del texto? | sí | no, solo lo señala |
+| ¿Copia al crearse? | sí | no |
+| Tamaño | variable (reserva memoria) | 16 bytes fijos |
+| ¿Modificable? | sí | no (solo lectura) |
+| Riesgo | ninguno de vida útil | quedar colgando si muere el dueño |
+
+### 5. Literales de texto: dónde viven
+* `"announce"` escrito en el código lo mete el compilador **dentro del ejecutable**, en la sección de solo lectura **`.rodata`**. Al ejecutar, se carga en memoria con el programa y vive **durante toda la ejecución**.
+* `find(dict, "announce")` recibe `{ puntero → 'a' en .rodata, 8 }`: datos reales que ya estaban en memoria.
+* Comprobación: `strings build/bittorrent_client | grep announce`.
+* **Una vista a un literal nunca queda colgando.** El caso peligroso es el texto creado en tiempo de ejecución por un `std::string` que se destruye.
+
+### 6. Paso por valor y zonas de memoria
+* **Por valor = copia en el parámetro**, una variable local en la pila que se destruye al salir. Lo que importa es **qué** se copia:
+  * `std::string_view` por valor → se copian los 16 bytes de la vista, **no el texto**. Por eso `string_view` se pasa **siempre por valor** (nunca `const std::string_view&`).
+  * `std::string` por valor → se crea otro string que **reserva memoria y copia todos los caracteres** (con `pieces`, 26800 bytes). Para solo leer: `const std::string&` o `std::string_view`.
+* Regla: copiar un objeto **vista** no copia los datos; copiar un objeto **dueño** (`string`, `vector`) copia también sus datos.
+
+| Zona | Qué guarda | Cuánto vive |
+|---|---|---|
+| `.rodata` (estática) | literales como `"announce"` | todo el programa |
+| Pila (*stack*) | variables locales y parámetros (incluidos los copiados por valor) | hasta el final de la función o bloque `{ }` |
+| Heap | el contenido que reservan `std::string`, `std::vector`... | hasta que su dueño lo libera |
+
+* Un `std::string` local es mixto: el objeto (puntero, tamaño, capacidad) en la pila; **sus caracteres** en el heap. Al destruirse el objeto libera los caracteres → una vista a ellos queda colgando.
+
+### 7. `[[nodiscard]]`
+* Atributo (C++17), como `[[maybe_unused]]`: "el valor devuelto es importante; si se ignora, avisa". Con `-Werror` → error de compilación.
+  ```cpp
+  find(dict, "announce");                   // ⚠ ignoring return value
+  const Value* v = find(dict, "announce");  // ✓
+  if (find(dict, "announce")) { ... }       // ✓
+  ```
+* **Cuándo:** funciones que solo calculan o buscan (`find`, `size`, `parse`) y las que devuelven un error o resultado que hay que comprobar (será clave en el decoder). **No** en funciones cuyo retorno es secundario a la acción que hacen.
+* Ejemplo de la librería estándar: `std::vector::empty()` es `[[nodiscard]]` desde C++20 porque se escribía `v.empty();` creyendo que vaciaba el vector (eso es `clear()`).
+* **Con mensaje (C++20):** `[[nodiscard("check for nullptr")]]`.
+* **Ignorarlo a propósito:** `static_cast<void>(find(dict, "x"));`.
+* **Error real encontrado:** escribí `[[no_discard]]`. Un atributo desconocido no es error: GCC lo **ignora y avisa** (`-Wattributes`); `-Werror` lo convirtió en error y evitó un `nodiscard` que no hacía nada.
+
+### 8. Comentarios en el código
+* **Pocos y explicando el porqué** (decisiones no obvias), no el qué. `// forward declaration` sobra; lo útil es *por qué* hace falta.
+* **El comentario más valioso:** las decisiones de diseño que alguien podría "arreglar" sin saber el motivo (p. ej. por qué `Dict` no es un `std::map`).
+* **En headers, documentar el contrato** de cada función: qué devuelve, cuándo devuelve `nullptr`, cuánto vive el resultado. Quien la llama no debería necesitar leer el `.cpp`.
+* `///` o `/** ... */` son el formato de **Doxygen** (genera documentación web); `//` basta mientras no se use.
+
+### 9. Fuentes: tipos incompletos en contenedores
+* **Propuesta N4510**, *"Minimal incomplete type support for standard containers"* (Zhihao Yuan, 2015), aprobada para C++17: solo `std::vector`, `std::list` y `std::forward_list` (los que las implementaciones ya soportaban de forma fiable). Los asociativos (`std::map`...) quedaron fuera.
+* **Estándar:** secciones `[vector.overview]`, `[list.overview]`, `[forward.list.overview]`. Borrador consultable en `eel.is/c++draft` (p. ej. `eel.is/c++draft/vector.overview`).
+* **cppreference:** página de `std::vector`, parámetro `T`, nota *(since C++17)*. La de `std::map` no la tiene.
+* **Por qué `std::map` funciona con GCC:** libstdc++ lo implementa como árbol de nodos enlazados por punteros. Es un **detalle de implementación**, no una garantía.
+* Hábito: comprobar en la fuente las afirmaciones técnicas que justifican una decisión de diseño.
+
+### 10. Estado y siguientes pasos
+1. ✅ `Value` con las cuatro alternativas (`std::int64_t`, `std::string`, `List`, `Dict`).
+2. 🚧 `find()`: declarada con `[[nodiscard]]`, falta implementarla en `bencode.cpp` y probarla: buscar una clave que existe, una que no, y llamarla con un `Value` que no es diccionario.
+3. ⬜ Empezar el decoder.
