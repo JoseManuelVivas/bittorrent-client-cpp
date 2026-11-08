@@ -163,3 +163,157 @@ git check-attr -a tests/data/debian-13.7.0-amd64-netinst.iso.torrent
 ```
 Resultado correcto: `binary: set`, `diff: unset`, `merge: unset`, `text: unset`. El `eol: lf` que aparece es irrelevante: `eol` solo se aplica a archivos de texto.
 * Salida vacía → el `.gitattributes` no existe, está vacío o no se ha guardado.
+
+---
+
+## [2026-11-08] Bencode, bytes y archivos binarios
+
+### 1. Bencode: un formato *binary-safe*
+* Formato de serialización de los `.torrent` (y de las respuestas del tracker y de DHT). Su **estructura** usa caracteres ASCII legibles:
+
+| Tipo | Sintaxis | Ejemplo |
+|---|---|---|
+| Entero | `i<número>e` | `i42e` → 42 |
+| String | `<longitud>:<bytes>` | `4:spam` → `spam` |
+| Lista | `l<elementos>e` | `l4:spami42ee` → `["spam", 42]` |
+| Diccionario | `d<clave><valor>...e` | `d3:keyi1ee` → `{"key": 1}` |
+
+* **Clave del formato:** un string no se delimita por un carácter final, sino por su **longitud prefijada**. `26800:` significa "lee exactamente 26800 bytes, sean los que sean". Por eso el contenido puede ser cualquier byte (`\0`, `\n`, `0xFF`...) sin confundir al parser: el formato es *binary-safe*.
+
+### 2. Por qué un `.torrent` es un archivo binario
+* Casi todo se lee como texto (`d8:announce...`), salvo el campo `pieces`: la concatenación de los hashes SHA-1 de cada pieza (**20 bytes en bruto** cada uno, no en hexadecimal). Ej.: `6:pieces26800:` → 26800 / 20 = 1340 piezas.
+* Los bytes de un hash son aleatorios a efectos prácticos: aparecen todos los valores posibles, incluidos `\0` y `\n`.
+* **Lo que hace binario a un archivo es el formato, no su contenido concreto:** basta con que el formato *permita* bytes arbitrarios. Un `.torrent` cuyos hashes casualmente fueran todos imprimibles seguiría siendo binario.
+* Otros formatos que mezclan texto y bytes: PDF (empieza por `%PDF-1.7` legible, luego datos comprimidos), PNG (`89` + `PNG`).
+
+### 3. Bytes, ASCII y texto
+* **Todos los archivos son bytes.** No existen "archivos de texto" como algo distinto en disco; la diferencia es cómo deben **interpretarse**:
+  * **Texto:** *todos* los bytes son caracteres válidos en una codificación (ASCII, UTF-8...), organizados en líneas. Se puede abrir, editar y guardar sin perder nada.
+  * **Binario:** *puede* contener bytes que no son texto, y cada byte cuenta exactamente como está.
+* **ASCII es solo una tabla de traducción** número ↔ carácter (0-127). En disco, `d8:announce` son los bytes `64 38 3A 61 6E 6E ...`; un editor los "ve" como letras porque aplica esa tabla.
+* En C++ un `char` **es** un byte y `'d'` **es** el número 100: comparar `byte == 'd'` funciona directamente, sin conversión.
+* Rango imprimible ASCII: 32-126. Fuera de él (o en secuencias UTF-8 inválidas) no hay carácter que mostrar.
+
+### 4. Cómo distingue un editor texto de binario
+* **No hay ninguna marca universal: lo adivina** con heurísticas:
+  1. **Bytes nulos (`0x00`):** casi nunca aparecen en texto. Git considera binario un archivo con `\0` en sus primeros 8000 bytes (base de `text=auto`).
+  2. **Validez UTF-8:** UTF-8 impone reglas sobre qué bytes pueden ir juntos; si se incumplen a menudo, probablemente no es texto.
+  3. **Extensión:** solo una pista (cualquiera puede renombrar un archivo).
+* **Magic numbers (firmas):** muchos formatos binarios empiezan con bytes fijos, aunque no es universal:
+
+| Formato | Primeros bytes | Como ASCII |
+|---|---|---|
+| PNG | `89 50 4E 47` | `.PNG` |
+| PDF | `25 50 44 46` | `%PDF` |
+| ZIP (`.docx`, `.jar`...) | `50 4B` | `PK` |
+| Ejecutable Linux (ELF) | `7F 45 4C 46` | `.ELF` |
+
+  * El comando `file` usa una base de datos de firmas. Bencode no tiene firma oficial, pero `file` reconoce un `.torrent` por su inicio `d8:announce`.
+* **BOM (*Byte Order Mark*):** el equivalente para texto, `EF BB BF` en UTF-8. Opcional y desaconsejado en Linux (rompe scripts y compiladores).
+* **Un byte no sabe si es texto:** solo es un número; es "texto" cuando alguien lo interpreta con una tabla de caracteres.
+
+### 5. Qué hace VS Code al abrir un `.torrent`
+* **Comprobación inicial:** busca bytes nulos al principio. Si los hay, no lo abre ("file is binary..."). El `.torrent` empieza con texto limpio y pasa el filtro.
+* **Decodifica todo el archivo como UTF-8**, byte a byte, sin "zonas": lo válido se dibuja; lo inválido se sustituye por **`�`** (U+FFFD, carácter de sustitución). No hay cambio de modo: al principio todo es válido, en `pieces` casi nada.
+* En `pieces` aparecen letras sueltas entre los `�` (p. ej. `PS^` en la guía): son bytes de hash que por casualidad caen en el rango imprimible.
+* **Peligro al guardar:** al mostrar `�` el byte original ya se ha perdido en memoria. Guardar escribe `EF BF BD` (3 bytes) en su lugar → hashes destrozados y tamaño del archivo alterado. Recuperación: `git restore <archivo>`.
+
+### 6. Cómo inspeccionar archivos binarios sin dañarlos
+* **VS Code en solo lectura** (cómodo para el día a día), en `.vscode/settings.json`:
+  ```json
+  {
+      "files.readonlyInclude": {
+          "**/*.torrent": true
+      }
+  }
+  ```
+* **`less archivo`:** solo lectura; muestra los bytes no textuales escapados (`<9F>`, `^@`) en vez de `�`. `/texto` busca, `q` sale.
+* **`strings archivo`:** extrae solo las secuencias de ≥4 caracteres imprimibles (URL del tracker, nombre de la ISO...).
+* **`xxd archivo | less`** o **`hexdump -C archivo | less`:** offset + bytes en hexadecimal + columna ASCII (no imprimibles como `.`).
+  * `xxd -s 300 -l 64 archivo`: 64 bytes desde la posición 300. Útil cuando el parser falla en un offset concreto.
+* **Extensión Hex Editor** (Microsoft) en VS Code: *Open With… → Hex Editor*. Bytes y ASCII lado a lado, con el offset y el valor de cada byte. Usarla solo para mirar.
+* **A futuro:** una función de *pretty-print* propia para el resultado del parser (árbol indentado, strings binarios como `<26800 bytes>` o en hex).
+
+### 7. Implicaciones para el parser de bencode
+* **No hay que "convertir a ASCII":** los bytes ya lo son. Se lee el archivo entero a un buffer de bytes y se recorre byte a byte, decidiendo por el carácter actual: `'i'` entero, `'l'` lista, `'d'` diccionario, dígito → string.
+* **Abrir el archivo en modo binario:** en Linux no cambia nada, pero expresa la intención y es portable.
+* **Nada de funciones de "C string"** (`strlen`, `strcpy`, `const char*` terminado en `\0`): se cortarían en el primer `\0` de `pieces`. Trabajar siempre con **puntero + longitud** (`std::string_view`). `std::string` también admite `\0` en medio.
+* **La única conversión real son los números:** en `i351272960e` o `26800:` los dígitos son caracteres (`'2'` es el byte 50, no el 2). Herramienta adecuada: `std::from_chars` (C++17): sin excepciones, independiente del *locale* e indica hasta dónde ha leído.
+* **Los strings no se convierten:** son "N bytes"; se guardan como vista (`std::string_view`) al buffer, sin copiar. Si son texto (`announce`, `name`) o binario (`pieces`) lo decide quien usa el resultado, no el parser.
+* **Validar la longitud declarada:** si pone `26800:` y quedan 100 bytes, sin comprobarlo es un *buffer overflow* (el caso de manual para ASan).
+* **No imprimir strings binarios** al depurar: mostrar su longitud o pasarlos a hexadecimal.
+
+---
+
+## [2026-11-08] Reestructuración: librería `btcore` y opciones compartidas
+
+### 1. Estructura de archivos
+```
+include/btclient/          # headers públicos (#include "btclient/bencode.h")
+├── bencode.h
+└── bencode_printer.h
+src/
+├── bencode.cpp            # decoder: bytes → árbol de valores (no imprime nada)
+├── bencode_printer.cpp    # printer: árbol → texto indentado (no sabe de bytes)
+└── main.cpp               # el cliente
+```
+* **Separar *parsear* de *mostrar*:** el decoder se reutilizará para el `.torrent`, las respuestas del tracker y DHT; el printer solo sirve para depurar.
+* **Subcarpeta `btclient/` en `include/`:** actúa como *namespace* de archivos. Evita choques de nombres con headers de terceros (`error.h`, `socket.h`...) y deja claro qué headers son del proyecto. Es la convención de todas las librerías serias (`<openssl/sha.h>`, `<boost/asio.hpp>`, `<fmt/core.h>`) y la que recomiendan la *Canonical Project Structure* (P1204) y el *Pitchfork layout*.
+
+### 2. Los tres targets del `CMakeLists.txt`
+```
+btclient_options (INTERFACE)  ← warnings + -Werror + sanitizers
+        │
+        ├──► btcore (STATIC)  ← bencode.cpp, bencode_printer.cpp; expone include/
+        │        │
+        └──► bittorrent_client (ejecutable) ← main.cpp
+```
+
+### 3. `btclient_options`: librería `INTERFACE`
+```cmake
+add_library(btclient_options INTERFACE)
+target_compile_options(btclient_options INTERFACE -Wall -Wextra ...)
+```
+* Una librería `INTERFACE` **no compila nada ni genera ningún archivo**: es un "paquete de configuración". Todo lo que se le añade con `INTERFACE` (flags de compilación, de enlazado, includes...) se aplica a quien la enlace.
+* **Por qué:** con varios targets (librería, cliente y, más adelante, tests y herramientas), los warnings y sanitizers se definen **una sola vez** en lugar de copiar el bloque en cada target.
+* **Por qué es crítico para los sanitizers:** ASan instrumenta los accesos a memoria **al compilar**. Si `btcore` se compilase sin `-fsanitize`, los accesos dentro del parser de bencode (el código que procesa datos no confiables) **no se comprobarían**, aunque el ejecutable sí lo tuviera.
+* **Alternativas** que se ven en otros proyectos: una `function()` de CMake que aplica las flags a un target, o un `foreach` sobre la lista de targets. El target `INTERFACE` es la forma más idiomática en CMake moderno, porque usa el mismo mecanismo de propagación que cualquier dependencia.
+
+### 4. `btcore`: librería estática
+```cmake
+add_library(btcore STATIC src/bencode.cpp src/bencode_printer.cpp)
+target_include_directories(btcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(btcore PRIVATE btclient_options)
+```
+* **`STATIC`:** genera `libbtcore.a`, un archivo con los `.o` empaquetados (con `ar`). Al enlazar el ejecutable, el código necesario se copia dentro del binario; no hace falta distribuir la librería aparte (a diferencia de una `.so` dinámica).
+* **`PUBLIC` en los includes:** `btcore` usa `include/` para compilarse **y** quien enlace `btcore` lo recibe automáticamente. Por eso el ejecutable ya no tiene su propio `target_include_directories`: puede hacer `#include "btclient/bencode.h"` solo por enlazar `btcore`.
+* **`PRIVATE` con `btclient_options`:** las flags se aplican al compilar `btcore`, pero `btcore` no "obliga" a sus consumidores a usarlas. Cada target decide enlazar `btclient_options` por su cuenta.
+* **Por qué una librería:** el ejecutable, los tests y las herramientas (`bencode_dump`) enlazarán el mismo código sin compilarlo ni duplicarlo varias veces.
+
+### 5. `bittorrent_client`: el ejecutable
+```cmake
+add_executable(bittorrent_client src/main.cpp)
+target_link_libraries(bittorrent_client PRIVATE btcore btclient_options)
+```
+* Solo contiene `main.cpp`; toda la lógica vive en `btcore`.
+* Enlaza `btclient_options` explícitamente porque, al ser `PRIVATE` en `btcore`, sus flags no llegan por esa vía.
+* Las opciones de enlazado de los sanitizers (`-fsanitize=...` en el *link*) se aplican aquí, que es donde se genera el binario final y se enlaza el runtime de ASan/UBSan.
+
+### 6. `PRIVATE`, `PUBLIC` e `INTERFACE` en `target_link_libraries`
+| Palabra | ¿Se aplica a este target? | ¿Se propaga a quien lo enlace? |
+|---|---|---|
+| `PRIVATE` | sí | no |
+| `PUBLIC` | sí | sí |
+| `INTERFACE` | no | sí |
+
+* Las mismas reglas valen para `target_include_directories`, `target_compile_options`, etc.
+
+### 7. Cómo crecer a partir de aquí
+* **Nuevo `.cpp` de lógica** (p. ej. `src/torrent.cpp`): añadirlo a la lista de `add_library(btcore ...)`.
+* **Nuevo ejecutable** (tests, `bencode_dump`):
+  ```cmake
+  add_executable(bencode_dump tools/bencode_dump.cpp)
+  target_link_libraries(bencode_dump PRIVATE btcore btclient_options)
+  ```
+* **Verificación:** `cmake --build build --verbose` debe mostrar `-fsanitize=address,undefined` en la compilación de **todos** los `.cpp` y en el enlazado final.
+* Una librería estática con `.cpp` vacíos compila sin problemas (en C++ una unidad de traducción vacía es válida; en C, `-Wpedantic` avisaría).
