@@ -317,3 +317,14 @@ target_link_libraries(bittorrent_client PRIVATE btcore btclient_options)
   ```
 * **Verificación:** `cmake --build build --verbose` debe mostrar `-fsanitize=address,undefined` en la compilación de **todos** los `.cpp` y en el enlazado final.
 * Una librería estática con `.cpp` vacíos compila sin problemas (en C++ una unidad de traducción vacía es válida; en C, `-Wpedantic` avisaría).
+
+### 8. Convenciones de headers y `namespace`
+* **`#pragma once`:** evita que un header se procese dos veces en la misma unidad de traducción. No es estándar ISO, pero lo soportan GCC, Clang y MSVC. Frente a los *include guards* clásicos (`#ifndef BTCLIENT_BENCODE_H` / `#define` / `#endif`): más corto y sin el error típico de copiar un `.h` y olvidar renombrar el guard.
+* **Cada `.cpp` incluye primero su propio header:** comprueba que el header es autosuficiente. Si le falta un `#include`, falla al compilar su `.cpp` en lugar de funcionar por casualidad en otro sitio donde ese include ya estaba.
+* **`namespace`:** es a los **nombres del código** (tipos, funciones, variables) lo que la carpeta `include/btclient/` es a los **nombres de archivo**: un "apellido" que evita choques.
+  * Problema: nombres genéricos como `Value` o `decode` en el ámbito global pueden chocar con los de una librería externa → error de redefinición o, peor, se usa el que no es.
+  * Uso: las declaraciones del `.h` **y** las definiciones del `.cpp` van dentro del mismo `namespace btclient { ... }`. Desde fuera: `btclient::decode(...)`.
+  * Ya se usaba sin saberlo: la librería estándar vive en `std` (`std::string`, `std::cout`...).
+  * Convención: comentar la llave de cierre, `}  // namespace btclient`, porque el bloque suele ocupar todo el archivo.
+  * **Nunca `using namespace` en un `.h`:** se aplicaría a todo archivo que lo incluya y reintroduce los choques. En un `.cpp` es aceptable (aunque escribir siempre `std::` es lo más claro).
+  * Un namespace por proyecto suele bastar; si crece, se pueden anidar con la sintaxis de C++17: `namespace btclient::bencode { ... }`.
