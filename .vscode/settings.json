@@ -1,5 +1,6 @@
 {
     "files.readonlyInclude": {
         "**/*.torrent": true
-    }
+    },
+    "files.insertFinalNewline": true
 }
