@@ -2,5 +2,6 @@
     "files.readonlyInclude": {
         "**/*.torrent": true
     },
-    "files.insertFinalNewline": true
+    "files.insertFinalNewline": true,
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
 }
