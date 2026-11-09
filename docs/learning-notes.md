@@ -561,5 +561,331 @@ target_link_libraries(bittorrent_client PRIVATE btcore btclient_options)
 
 ### 10. Estado y siguientes pasos
 1. ✅ `Value` con las cuatro alternativas (`std::int64_t`, `std::string`, `List`, `Dict`).
-2. 🚧 `find()`: declarada con `[[nodiscard]]`, falta implementarla en `bencode.cpp` y probarla: buscar una clave que existe, una que no, y llamarla con un `Value` que no es diccionario.
+2. ✅ `find()`: declarada con `[[nodiscard]]`, implementada en `bencode.cpp` y probada. *(Ver entrada siguiente.)*
 3. ⬜ Empezar el decoder.
+
+---
+
+## [2026-11-09] Implementando `find()`: punteros, referencias, `auto` e inicialización
+
+### 1. La implementación
+```cpp
+const Value* find(const Value& dictionary, std::string_view key) {
+    const Dict* dict = std::get_if<Dict>(&dictionary.data);
+    if (dict == nullptr) { return nullptr; }
+
+    for (const auto& entry : *dict) {
+        if (entry.first == key) {
+            return &entry.second;
+        }
+    }
+    return nullptr;
+}
+```
+* **`std::get_if<Dict>(&dictionary.data)`:**
+  * Necesita el tipo entre `< >`: no se puede deducir cuál de las alternativas se quiere.
+  * Recibe la **dirección** del variant (`&`), no el variant: puntero de entrada, puntero de salida (`nullptr` si no es esa alternativa; incluso acepta un puntero nulo). Lo distingue de `std::get` (variant → excepción si falla).
+  * El `const` del resultado se propaga solo: `dictionary` es `const` → `const Dict*`.
+* **Guard clause / early return:** `if (dict == nullptr) { return nullptr; }` sale pronto y evita anidar el resto de la función. `if (!dict)` es equivalente (un puntero nulo se convierte a `false`): `== nullptr` es más explícito, `!dict` más compacto.
+* **`[[nodiscard]]` solo en la declaración** (el header, que es lo que ve quien llama). Repetirlo en la definición no es error, pero puede desincronizarse.
+* **Errores encontrados al compilar una versión a medias** (archivo sin guardar):
+  * `unused parameter 'key'`.
+  * `control reaches end of non-void function` (`-Wreturn-type`): una función que debe devolver algo y llega al final sin `return` es *undefined behavior* (devolvería basura). `-Wall` lo detecta, `-Werror` lo para.
+* **Recordatorio:** guardar (`Ctrl+S`) antes de compilar; el compilador lee el disco, no el editor.
+
+### 2. El `for` de rango y el *dangling pointer*
+* **`*dict`:** `dict` es un puntero; el `for` necesita el contenedor, así que hay que **desreferenciarlo**.
+* **Sin `&` (`const auto entry`):** en cada vuelta se crea una **copia** del par en la pila, que se destruye al acabar la vuelta. `return &entry.second;` devolvería la dirección de esa copia → *dangling pointer* (ASan: *stack-use-after-scope*). Además copia cada clave y cada `Value` (con `pieces`, 26800 bytes) para nada.
+* **Con `&` (`const auto& entry`):** `entry` es **otro nombre para el elemento que ya está en el vector**. `&entry.second` apunta al `Value` real, que sigue vivo mientras exista el diccionario.
+  ```
+  Vector (heap):  [ ("length", 42) ][ ("name", "debian") ]
+                          ▲
+                          └── entry (referencia) → &entry.second apunta DENTRO del vector
+  ```
+* **Structured bindings (C++17):** desempaquetan el par en dos nombres, sin copia gracias a `const auto&`:
+  ```cpp
+  for (const auto& [k, v] : *dict) {
+      if (k == key) { return &v; }
+  }
+  ```
+  No se pueden llamar `key` (ya existe el parámetro): `-Wshadow` lo marcaría como error.
+* **Experimento útil:** quitar el `&` a propósito y ver cómo ASan detecta el error.
+
+### 3. Cómo funciona el `for` de rango por dentro
+* Es azúcar sintáctico sobre `begin()`/`end()`:
+  ```cpp
+  for (const auto& entry : contenedor) { ... }
+  // ≈
+  auto it = contenedor.begin(); auto fin = contenedor.end();
+  for (; it != fin; ++it) { const auto& entry = *it; ... }
+  ```
+* **Funciona con cualquier tipo**, no solo con la librería estándar:
+  1. Arrays de C (el compilador conoce su tamaño).
+  2. Clases con `begin()` y `end()` miembro que devuelvan un **iterador**: algo comparable con `!=`, avanzable con `++` y desreferenciable con `*` (un puntero cumple las tres).
+  3. Tipos con funciones libres `begin(x)` / `end(x)`.
+  4. Listas entre llaves: `for (int n : {1, 2, 3})`.
+* Los contenedores estándar funcionan porque tienen `begin()`/`end()`, no por un trato especial. `Value` no los tiene: por eso primero se saca el `Dict`/`List` del variant.
+
+### 4. Punteros y referencias
+* **`.` vs `->`:**
+  * `.` con un **objeto** o una **referencia** (una referencia *es* el objeto con otro nombre).
+  * `->` con un **puntero** (una variable distinta que guarda una dirección). `p->first` ≡ `(*p).first`.
+
+| Declaración | Qué es | Acceso a miembro |
+|---|---|---|
+| `Value v;` | objeto | `v.data` |
+| `const Value& r = v;` | referencia | `r.data` |
+| `const Value* p = &v;` | puntero | `p->data` o `(*p).data` |
+
+* **`&` y `*` significan cosas distintas según dónde estén:**
+
+| Símbolo | En una declaración (junto al tipo) | En una expresión (delante de una variable) |
+|---|---|---|
+| `&` | referencia: `Value& r` | dirección de: `&v` → puntero |
+| `*` | puntero: `Value* p` | desreferenciar: `*p` → el objeto |
+
+  En expresiones son opuestos: `&` va del objeto al puntero, `*` del puntero al objeto (`*&v` es `v`). `return &entry.second;` devuelve un **puntero** (operador dirección), no una referencia.
+
+* **En C no existen las referencias:** solo punteros. "Pasar por referencia" en C significa pasar un puntero (`incrementa(&n)` con `void incrementa(int* x) { (*x)++; }`). C++ añadió `T&`; por debajo suele implementarse como un puntero, pero con garantías:
+
+| | Puntero (`T*`) | Referencia (`T&`) |
+|---|---|---|
+| ¿Puede ser nulo? | sí (`nullptr`) | no |
+| ¿Hay que inicializarlo? | no | sí, al declararla |
+| ¿Puede cambiar a qué apunta? | sí | no, queda ligada para siempre |
+| Aritmética (`p + 1`) | sí | no |
+| Acceso a miembros | `->` | `.` |
+
+* Se crearon para pasar objetos grandes sin copiar con sintaxis limpia y sin riesgo de nulo, y para la sobrecarga de operadores (`a + b`, `cout << x`).
+* Pregunta a hacerse con cada `&` o `*` en una declaración: **¿es dueño, es una referencia o es un puntero que puede ser nulo?**
+
+### 5. Referencias constantes (`const T&`)
+* Referencia a través de la cual **no se puede modificar** el objeto (el objeto en sí no tiene por qué ser `const`).
+* Forma estándar de pasar objetos grandes de solo lectura: **sin copia** (referencia) y con **promesa de no modificar** (`const`), visible en la firma y vigilada por el compilador.
+
+| Firma | ¿Copia? | ¿Modifica el original? | Uso típico |
+|---|---|---|---|
+| `void f(Value v)` | sí | no (modifica su copia) | tipos pequeños (`int`, `string_view`) o cuando se quiere una copia |
+| `void f(Value& v)` | no | **sí** | la función debe modificar el objeto de quien llama |
+| `void f(const Value& v)` | no | no | objetos grandes de solo lectura |
+
+* **Aceptan temporales** (las no constantes no): `f(const std::string&)` admite `f("hola")` porque C++ crea un `std::string` temporal que vive durante la llamada; modificar algo que va a desaparecer sería un error casi seguro.
+* **Const-correctness:** el `const` se propaga en cadena. Como `dictionary` es `const Value&`, todo lo que sale de él es `const` (`const Dict*`, `const auto&`, `const Value*`): si `find` recibe el diccionario como solo lectura, no puede devolver una forma de modificarlo.
+
+### 6. `auto`
+* El compilador **deduce el tipo** a partir de la inicialización (C++11). Se decide **al compilar**: la variable tiene un tipo fijo (no es el `var` de JavaScript).
+  ```cpp
+  auto p = find(dict, "name");   // const Value*
+  ```
+* En el `for`, `const auto& entry` ahorra escribir `const std::pair<std::string, Value>& entry`.
+* **Trampa:** `auto` solo deduce el tipo "limpio", **sin `&` ni `const`** → hace una copia:
+  ```cpp
+  const Value& ref = ...;
+  auto a = ref;         // Value          → COPIA
+  auto& b = ref;        // const Value&   → referencia
+  const auto& c = ref;  // const Value&   → referencia de solo lectura (explícito)
+  ```
+  Tú decides copia o referencia; `auto` solo rellena el tipo base.
+* **Cuándo:** tipo largo y obvio por el contexto (`for`, iteradores), tipo ya visible en la línea, tipos sin nombre (lambdas). **Mejor no** cuando oculta información importante (p. ej. si un entero es `int` o `int64_t`). *"Usa `auto` cuando el tipo no aporte nada al lector; escríbelo cuando sí."*
+
+### 7. Construir pares e inicializar agregados
+* **`< >` para tipos, `( )` / `{ }` para valores:** `std::pair<"length", 5>` no compila (son valores, no tipos).
+  ```cpp
+  dictionary.push_back(std::pair<std::string, btclient::Value>("length", btclient::Value{5})); // completo
+  dictionary.push_back({"length", btclient::Value{5}});   // el vector ya sabe el tipo del par
+  dictionary.emplace_back("length", btclient::Value{5});  // construye el par dentro del vector, sin temporal
+  ```
+* **`Value{5}` es necesario:** `Value` no tiene constructores propios, así que C++ no convierte un `5` en `Value` automáticamente.
+  * Alternativa de diseño: darle constructores para cada alternativa y poder escribir `{"length", 5}`. Coste: escribirlos, y las conversiones implícitas tienen trampas (un literal `"hola"` podría elegir la alternativa equivocada). **Decisión:** de momento, construcción explícita; reconsiderar al escribir el decoder.
+* **Prefijo `btclient::`:** necesario fuera del namespace (en `main.cpp`); dentro de `bencode.cpp` no. En un `.cpp` (nunca en un header): `using btclient::Value;` (mejor) o `using namespace btclient;`.
+* **Inicialización de agregados** (heredada de C): las llaves asignan los valores a los miembros **en orden de declaración**; los que faltan se inicializan a cero.
+  ```cpp
+  struct Punto { int x; int y; };
+  Punto p{1, 2};   // x = 1, y = 2
+  Punto q{7};      // x = 7, y = 0
+  ```
+  `Value{5}` inicializa su único miembro, `data`.
+  * **Inicializadores designados (C++20):** `btclient::Value v{.data = 5};` (los campos, en orden de declaración).
+  * **Solo para agregados:** sin constructores propios, sin miembros privados/protegidos, sin funciones virtuales. Si `Value` recibe constructores, deja de ser agregado y `{...}` pasa a llamarlos.
+* **Trampa del operador coma:** `push_back(("length", btclient::Value{5}))`. Los paréntesis interiores no crean un par: son una expresión, y la coma es el **operador coma** de C (`(a, b)` evalúa `a`, lo descarta y vale `b`). Llega solo un `Value` y el vector de pares no lo acepta; GCC avisa también de que el operando izquierdo no tiene efecto.
+  * `( )` sueltos → agrupan una expresión.
+  * `{ }` → construyen un objeto del tipo esperado.
+  * `Tipo( )` → construye (los paréntesis solo construyen con un tipo delante).
+
+### 8. Comentarios: estándares
+* **No hay un estándar oficial** en C++; cada proyecto sigue una guía. Referencias: **Google C++ Style Guide** (la más citada, con sección de comentarios), **LLVM Coding Standards**, **C++ Core Guidelines** (sección NL).
+
+| Dónde | Qué comentar |
+|---|---|
+| Header | **qué hace** y su **contrato** (parámetros, retorno, errores, vida útil del resultado): documentación para quien la *usa* |
+| `.cpp` | **por qué** se hace algo de forma no obvia: documentación para quien la *mantiene* |
+| En ningún sitio | lo que el código ya dice |
+
+* `find` no necesita comentarios en el `.cpp`: el contrato está en el header y la implementación se explica sola.
+* `TODO` para pendientes (`// TODO(chefo): validate that keys are sorted`), fáciles de buscar con grep.
+* Cabecera de archivo (licencia, descripción): opcional en un proyecto personal. Doxygen: solo si se genera documentación.
+* **Decisión:** usar la Google C++ Style Guide como referencia en nombres y comentarios, y ser coherente. Pendiente: elegir si se indenta dentro de los `namespace` (Google no lo hace) y aplicarlo en todos los archivos.
+
+### 9. Lecciones de la prueba de `find`
+* Resultado: los tres casos correctos (clave que existe, clave que no, `Value` que no es diccionario).
+* **Comprobar el valor, no solo que exista:** si `find` devolviera el `Value` equivocado, "no es `nullptr`" seguiría pasando. Se comprueba con `->` (`resultado->data`).
+* **Las pruebas que solo imprimen al acertar fallan en silencio:** si algo va mal, simplemente falta una línea. Una prueba debe avisar claramente al fallar → argumento para un **framework de tests** (GoogleTest).
+* Nombres claros en las pruebas (no invertir `dict`/`dictionary` respecto a `find`).
+* Las pruebas temporales en `main.cpp` no se suben: `git restore src/main.cpp`.
+
+### 10. Estado y siguientes pasos
+1. ✅ `Value` con cuatro alternativas.
+2. ✅ `find()` implementada y probada a mano.
+3. ⬜ Montar **GoogleTest** con CMake (`FetchContent`) y pasar la prueba de `find` a un test de verdad.
+4. ⬜ Diseñar el decoder: firma (¿`std::string_view` de entrada?), estrategia de errores, cómo llevar la posición de lectura.
+
+---
+
+## [2026-11-09] Igualdad de `Value`, `const` en punteros y cómo leer errores
+
+### 1. `operator==` generado por el compilador (C++20)
+* Un `struct` **no tiene `==` por defecto**. Desde C++20 se puede pedir que el compilador lo genere comparando miembro a miembro:
+  ```cpp
+  struct Value {
+      std::variant<std::int64_t, std::string, List, Dict> data;
+      bool operator==(const Value&) const = default;
+  };
+  ```
+  * `operator==` es la función que se llama al escribir `a == b`.
+  * `= default`: "escríbela tú". Compara `data` con `data`; el `variant` se compara por alternativa activa y valor, y es **recursivo** (dos listas son iguales si lo son sus elementos). Funciona con el tipo recursivo (comprobado con GCC 15 y las flags del proyecto).
+* **Por qué:** los tests del decoder compararán árboles enteros ("decodificar `li1ei2ee` debe dar la lista `[1, 2]`") y GoogleTest usa `==` (`EXPECT_EQ`).
+* **Tiene que ir dentro del `struct`.** Fuera, GCC lo toma como función libre y da dos errores:
+  * *"non-member function cannot have cv-qualifier"*: el `const` final ("no modifica el objeto sobre el que se llama") solo existe en funciones **miembro**.
+  * *"must have exactly two arguments"*: un `==` libre necesita los dos lados como parámetros; como miembro, el lado izquierdo es el propio objeto.
+* **Uso:** comparar `Value` con `Value`, desreferenciando el puntero:
+  ```cpp
+  const btclient::Value* item = btclient::find(dict, "length");
+  if (item != nullptr && *item == btclient::Value{5}) { ... }
+  ```
+  * `item` → puntero; `*item` → el `Value` (el `*` va **delante**: `item*` se lee como una multiplicación incompleta → *"expected primary-expression before '=='"*); `item->data` → el `variant` de dentro.
+  * Regla mental: **un `Value` es una caja, `.data` es lo que hay dentro; para comparar, cajas con cajas.**
+
+### 2. `std::variant` solo se compara con otro `variant`
+* `item->data == btclient::Value{5}` → error: `variant` vs `Value`.
+* `item->data == std::int64_t{5}` → error: `variant` no define `==` contra una de sus alternativas, solo contra otro `variant` del mismo tipo.
+* Formas válidas:
+  1. `*item == btclient::Value{5}` (con el `operator==` de `Value`).
+  2. `get_if` + comparar el valor: `const std::int64_t* n = std::get_if<std::int64_t>(&item->data); if (n && *n == 5)`.
+  3. `holds_alternative` + `get`.
+* Para **comparar**, cajas con cajas; `get`/`get_if`/`holds_alternative` son para **sacar** el contenido y usarlo.
+* Escribir siempre `std::int64_t`: `<cstdint>` suele exponer también `int64_t` en el ámbito global, pero solo `std::` está garantizado.
+
+### 3. `const` en punteros
+* `find` devuelve `const Value*` ("puedes mirar, no modificar"). Guardarlo en un `Value*` da *"invalid conversion from 'const btclient::Value\*' to 'btclient::Value\*'"*: C++ **no permite quitar un `const` en silencio** (rompería la promesa de `find`); añadirlo sí (solo restringe más).
+  ```cpp
+  const btclient::Value* item = btclient::find(dict, "length");
+  const auto* item = btclient::find(dict, "length");   // auto conserva el const; const auto* lo hace visible
+  ```
+* **Declarar e inicializar en la misma línea.** `Value* item;` seguido de `item = ...;` deja un puntero **sin inicializar** (apunta a una dirección cualquiera) entre ambas líneas. Regla: declarar cada variable donde se necesita y darle valor ahí mismo.
+
+### 4. Evaluación en cortocircuito
+* En `a && b`, si `a` es `false`, **`b` no se evalúa** (con `||`, si `a` es `true`).
+* Por eso es seguro `item != nullptr && *item == ...`: si `item` es nulo, nunca se desreferencia. **El orden importa:** la comprobación de nulo va primero.
+
+### 5. Cómo leer errores largos de plantillas
+* Un error con tipos de la librería estándar puede ocupar cientos de líneas. **Lo importante está en la primera línea con `error:`**:
+  ```
+  main.cpp:12:39: error: no match for 'operator==' (operand types are
+    'const std::variant<long int, std::__cxx11::basic_string<...>, ...>' and 'btclient::Value')
+  ```
+  → archivo, línea, columna, y qué tipos intervienen.
+* Lo que sigue (*"there are 25 candidates"*, `allocator`, `error_code`, `monostate`...) es GCC listando todos los `==` que conoce y por qué no encajan. Casi nunca hace falta; como mucho, el candidato que es tuyo (aquí: *"no known conversion for argument 1 from 'variant' to 'const Value&'"*).
+* `std::int64_t` aparece como `long int` y `std::string` como `std::__cxx11::basic_string<char, ...>`: son sus nombres reales en libstdc++.
+
+### 6. IntelliSense vs el estándar de C++
+* VS Code marcaba `= default` en `operator==` con *"'= default' solo puede aparecer en los constructores predeterminados..."* (C/C++ 1774), aunque compilaba.
+* **Causa:** IntelliSense no lee el `CMakeLists.txt` y asumía un estándar anterior a C++20 (antes de C++20, `= default` solo valía para constructores, destructores y asignaciones).
+* **Solución:** usar CMake Tools como proveedor de configuración, en `.vscode/settings.json`:
+  ```json
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
+  ```
+  IntelliSense usa así las mismas flags que CMake (`-std=c++20`, rutas de include). Alternativa parcial: `"C_Cpp.default.cppStandard": "c++20"` (hay que mantenerla a mano). Tras cambiarlo: `Ctrl+Shift+P` → *Developer: Reload Window*.
+* Mismo problema de fondo que con las rutas de `#include`: **editor y compilador deben ver la misma configuración**. Ante la duda, manda el compilador.
+
+---
+
+## Git: formato de commits y flujo de trabajo
+
+### 1. Conventional Commits
+Formato usado en el proyecto ([conventionalcommits.org](https://www.conventionalcommits.org)):
+```
+<tipo>(<ámbito opcional>): <descripción>
+
+<cuerpo opcional>
+
+<pie opcional>
+```
+* Ejemplos reales del repo:
+  * `build: add btcore library and shared build options target`
+  * `feat(bencode): implement find() for dictionary key lookup`
+  * `docs: add find() implementation notes to learning log`
+  * `chore: open .torrent files as read-only in VS Code`
+  * `style: fix namespace closing comment in bencode.cpp`
+
+### 2. Tipos
+| Tipo | Cuándo | Ejemplo |
+|---|---|---|
+| `feat` | funcionalidad nueva | `feat(bencode): add list alternative to Value` |
+| `fix` | arreglo de un bug | `fix(bencode): reject negative string lengths` |
+| `docs` | solo documentación (README, bitácora, roadmap) | `docs: add project roadmap` |
+| `test` | añadir o cambiar tests | `test(bencode): add find() unit tests` |
+| `refactor` | cambiar código sin cambiar comportamiento | `refactor: add btclient namespace and fix include paths` |
+| `style` | formato, espacios, comentarios mal colocados (sin cambio de lógica) | `style: fix namespace closing comment` |
+| `build` | sistema de compilación o dependencias (CMake) | `build: fetch GoogleTest with FetchContent` |
+| `ci` | integración continua (GitHub Actions) | `ci: build and test on every push` |
+| `chore` | mantenimiento y configuración que no encaja en lo anterior (`.vscode`, `.gitignore`) | `chore: insert final newline on save in VS Code` |
+| `perf` | mejora de rendimiento | `perf: avoid copying piece hashes` |
+
+### 3. Ámbito (opcional)
+* Entre paréntesis tras el tipo: la parte del proyecto afectada → `feat(bencode)`, `fix(tracker)`, `test(peer)`.
+* Útil cuando el proyecto tiene varios módulos; se omite si el cambio es general.
+
+### 4. Reglas de la descripción (título)
+* **Imperativo**, como una orden: "add", "fix", "remove" (no "added", "adding", "adds"). Truco: debe completar la frase *"If applied, this commit will..."*.
+* **En minúscula tras los dos puntos y sin punto final.**
+* **Corto:** ≤ ~72 caracteres (GitHub corta los más largos).
+* **Qué cambia, no cómo:** "add find() for dictionary key lookup", no "add a for loop over the vector".
+* **En inglés** (portfolio, estándar de la industria).
+
+### 5. Cuerpo y pie (opcionales)
+* **Cuerpo:** separado del título por una línea en blanco. Explica el **porqué** o detalla un cambio con varias partes (viñetas con `-`).
+  ```bash
+  git commit -m "chore: open .torrent files as read-only in VS Code" -m "Prevents the editor from corrupting the binary piece hashes when saving."
+  ```
+  Cada `-m` es un párrafo: el primero es el título, el segundo el cuerpo.
+* **Pie:** referencias o avisos. `BREAKING CHANGE: ...` (o `feat!:`) para cambios incompatibles; `Closes #12` para cerrar un issue.
+
+### 6. Un commit = un cambio lógico
+* Si para describirlo hace falta "y" ("add X **and** fix Y"), probablemente son dos commits.
+* Mejor varios commits pequeños que uno enorme: el historial se lee como una historia y es fácil encontrar (o revertir) un cambio concreto.
+* Separar código y documentación (`feat` por un lado, `docs` por otro).
+* No subir pruebas temporales ni código comentado (`git restore src/main.cpp`).
+
+### 7. Flujo de `git add`
+1. `git status` → qué ha cambiado.
+2. Agrupar por **motivo**, no por archivo.
+3. `git add <archivos>` → solo los de ese cambio. **Evitar `git add .`** (mete todo; así se coló el `.torrent` en el commit del roadmap).
+   * `git add -p` → elegir trozo a trozo si un archivo tiene cambios de motivos distintos (interactivo).
+4. `git diff --staged` → revisar exactamente qué entra en el commit.
+5. `git commit -m "tipo(ámbito): descripción"`.
+6. Repetir hasta que `git status` diga `working tree clean`.
+7. `git push` (la primera vez en una rama nueva: `git push -u origin <rama>`).
+
+### 8. Deshacer cosas (antes de hacer push)
+| Situación | Comando |
+|---|---|
+| Sacar un archivo del stage (sin perder cambios) | `git restore --staged <archivo>` |
+| Descartar los cambios de un archivo (¡se pierden!) | `git restore <archivo>` |
+| Deshacer el último commit conservando los cambios en el stage | `git reset --soft HEAD~1` |
+| Corregir el último commit (mensaje o autor) | `git commit --amend` (`--reset-author --no-edit` para el autor) |
+* **Solo antes de hacer push:** reescribir commits ya subidos obliga a `push --force` y descoordina a cualquiera que los tenga.
+
+### 9. Ramas
+* Trabajo en ramas de funcionalidad (`parser`), no directamente en `main`.
+* Cuando la funcionalidad esté completa: **Pull Request** de la rama a `main` en GitHub y fusionarla, aunque se trabaje solo (flujo profesional y queda visible en el perfil).
+* Versiones: `git tag v0.2.0` + `git push --tags` al cumplir un hito.
