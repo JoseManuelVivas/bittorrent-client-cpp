@@ -13,13 +13,18 @@ Tooling and engineering practices in place before writing protocol code.
 - ✅ CMake build system (C++20, no compiler extensions)
 - ✅ Strict warning set (`-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow`) with optional `-Werror`
 - ✅ AddressSanitizer and UndefinedBehaviorSanitizer enabled in Debug builds
+- ✅ Core logic split into a reusable static library (`btcore`) shared by the client and the tests
+- ✅ Unit testing infrastructure: GoogleTest fetched at configure time (pinned release, SHA-256 verified) and registered with CTest
 - ✅ Learning log documenting technical decisions ([`learning-notes.md`](learning-notes.md))
 
 ## Phase 1 — Core Download (BEP 3) 🚧
 
 Download a single-file torrent end to end from a `.torrent` file and an HTTP tracker.
 
-- ⬜ **Bencode decoder** written from scratch, with strict validation of untrusted input
+- 🚧 **Bencode decoder** written from scratch, with strict validation of untrusted input
+  - ✅ Recursive value type (`std::variant` of integer, byte string, list and dictionary) with equality comparison
+  - ✅ Dictionary key lookup
+  - ⬜ Decoding of integers, strings, lists and dictionaries from raw bytes
 - ⬜ **Metainfo parsing**: extract announce URL, piece length, piece hashes, file name and size
 - ⬜ **Info hash**: SHA-1 over the raw bencoded `info` dictionary
 - ⬜ **HTTP tracker announce**: build the request, parse the compact peer list ([BEP 23](https://www.bittorrent.org/beps/bep_0023.html))
@@ -29,11 +34,11 @@ Download a single-file torrent end to end from a `.torrent` file and an HTTP tra
 - ⬜ **Concurrent download** from multiple peers with a shared work queue
 - ⬜ **Output**: assemble verified pieces and write the final file to disk
 
-## Phase 2 — Quality and Reliability
+## Phase 2 — Quality and Reliability 🚧
 
 Make correctness verifiable and regressions visible.
 
-- ⬜ Unit tests for the bencode decoder, metainfo parser and message framing
+- 🚧 Unit tests for the bencode decoder, metainfo parser and message framing
 - ⬜ Continuous integration with GitHub Actions (build + tests, with sanitizers)
 - ⬜ Fuzz testing of the bencode decoder and message parser (libFuzzer)
 - ⬜ Timeouts, retry logic and graceful handling of misbehaving peers
