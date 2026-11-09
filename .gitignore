@@ -1,5 +1,5 @@
-# Carpeta de ficheros compilados
+# Build output
 build/
 
-# Fichero que se crea al pasar cosas de Windows a WSL
+# Metadata created when copying files from Windows into WSL
 *:Zone.Identifier
