@@ -889,3 +889,199 @@ Formato usado en el proyecto ([conventionalcommits.org](https://www.conventional
 * Trabajo en ramas de funcionalidad (`parser`), no directamente en `main`.
 * Cuando la funcionalidad esté completa: **Pull Request** de la rama a `main` en GitHub y fusionarla, aunque se trabaje solo (flujo profesional y queda visible en el perfil).
 * Versiones: `git tag v0.2.0` + `git push --tags` al cumplir un hito.
+
+---
+
+## [2026-11-09] Tests unitarios con GoogleTest
+
+### 1. Conceptos
+* **Test:** código que comprueba que otro código funciona (la prueba de `find` en `main.cpp` ya lo era).
+* **Test unitario:** prueba **una pieza pequeña** (una función) de forma aislada, un caso por test.
+* **Problemas de las pruebas a mano en `main.cpp`:** se borraban tras usarlas (`git restore`) y fallaban **en silencio** (solo imprimían al acertar).
+* **GoogleTest:** la librería de tests más usada en C++ (Google). Los tests quedan guardados en `tests/`, en un ejecutable propio separado del cliente, y cada fallo se informa con archivo, línea, valor esperado y valor obtenido.
+* **Por qué importa:** el decoder tendrá decenas de casos (enteros, negativos, vacíos, anidados, datos corruptos); los tests detectan al momento si un cambio rompe algo que funcionaba (regresiones). En un portfolio C++ destacan.
+
+### 2. Integración con CMake
+```cmake
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/releases/download/v1.18.0/googletest-1.18.0.tar.gz
+    URL_HASH SHA256=6e3191c1455468b3fc35a417fb565c1c5071aee1b7e7f85e30cf48a98d37d8b5
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(googletest)
+
+enable_testing()
+add_executable(btclient_tests tests/bencode_test.cpp)
+target_link_libraries(btclient_tests PRIVATE btcore btclient_options GTest::gtest_main)
+
+include(GoogleTest)
+gtest_discover_tests(btclient_tests)
+```
+* **`FetchContent`:** descarga código de terceros al configurar y lo integra como targets de CMake, sin instalar nada en el sistema. Queda en `build/_deps/` (`googletest-src`, `-build`, `-subbuild`). La primera configuración necesita internet.
+* **Versión fija:** URL de una release concreta (`v1.18.0`) o de un commit concreto (hash en la URL), nunca "la última": el build no cambia solo. La URL de release es más legible.
+* **`URL_HASH SHA256=...`:** CMake verifica el archivo descargado; si no coincide (manipulado o corrupto), se niega a usarlo. Buena práctica de seguridad con dependencias.
+  * Calcularlo: `curl -sL <url> | sha256sum`.
+  * La salida `6e31...d8b5  -` → el hash son solo los **64 caracteres hex** (256 bits = 32 bytes, 2 hex por byte). Los dos espacios son separador y `-` significa "entrada estándar" (los datos llegaron por la tubería, no de un archivo).
+  * Error encontrado: `SHA256=SHA256=...` (duplicado) → *"URL_HASH is set to..."*, configuración rechazada. Formato correcto: `ALGORITMO=hash`, una vez.
+  * Relación con el proyecto: los hashes de las piezas son **SHA-1** (20 bytes = 40 hex), pero en el `.torrent` van en **binario**, no en hex.
+* **`DOWNLOAD_EXTRACT_TIMESTAMP TRUE`:** evita el aviso de la política CMP0135 (fecha de los archivos descomprimidos).
+* **`gtest_force_shared_crt`** (aparece en la guía oficial): solo afecta a Windows/MSVC (runtime de C). En Linux no hace nada.
+* **`enable_testing()`:** activa CTest.
+* **`GTest::gtest_main`:** GoogleTest + un `main()` ya hecho → el archivo de tests no lleva `main`.
+* **`gtest_discover_tests`:** CTest registra cada `TEST` por separado.
+* **Los warnings estrictos no afectan a GoogleTest:** van en `btclient_options`, que GoogleTest no enlaza. Con flags globales, `-Werror` podría romper el build por código ajeno.
+
+### 3. Mejoras opcionales (pendientes)
+* **gMock:** segunda librería incluida en GoogleTest para **objetos simulados** (*mocks*), p. ej. un tracker falso que responde lo que se le diga, sin red real; también verifica que el código llamó a algo con ciertos argumentos. Útil en la fase de red; ahora no. Se puede desactivar con `set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)` antes de `FetchContent_MakeAvailable` para compilar menos.
+* **Tests desactivables (`BUILD_TESTING`):** `include(CTest)` crea esta opción (y llama a `enable_testing()`). Envolviendo la sección de tests en `if(BUILD_TESTING) ... endif()`, quien solo quiera el cliente usa `-DBUILD_TESTING=OFF` y no descarga GoogleTest. Por defecto `ON`. Convención que esperan gestores de paquetes y otros proyectos.
+
+### 4. Cómo funciona GoogleTest
+```cpp
+TEST(Find, ReturnsValueForExistingKey) {
+    btclient::Value dictionary{btclient::Dict{{"length", btclient::Value{5}}}};
+
+    const btclient::Value* item = btclient::find(dictionary, "length");
+
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(*item, btclient::Value{5});
+}
+```
+* **`TEST(Grupo, Caso)`:** macro que crea una función y la **registra** en una lista interna. Nombre completo: `Find.ReturnsValueForExistingKey`. El `main` de `gtest_main` recorre la lista y ejecuta todos.
+* **Patrón Arrange-Act-Assert:** preparar / ejecutar / comprobar, separados por líneas en blanco.
+* **Nombres:** grupo = lo que se prueba; caso en tercera persona describiendo el comportamiento (`ReturnsNullForMissingKey`).
+* **`EXPECT_` vs `ASSERT_`:**
+  * `EXPECT_*`: si falla, lo apunta y **sigue** (se ven todos los fallos). **Por defecto.**
+  * `ASSERT_*`: si falla, **termina ese test**. Solo cuando seguir no tiene sentido o es peligroso (p. ej. `ASSERT_NE(item, nullptr)` antes de `*item`). Leer un `ASSERT_` comunica "lo de abajo depende de esto".
+  * En la última línea del test son equivalentes, pero por convención `EXPECT_`.
+  * Un test que falla no detiene a los demás.
+* **Comprobar el valor exacto esperado:** `EXPECT_EQ(*item, Value{...})` es mejor que `EXPECT_NE(*item, Value{5})`, que solo descarta un valor y deja pasar cualquier otro error. `EXPECT_NE` solo cuando lo que importa es la diferencia.
+* **No desreferenciar sin comprobar:** `EXPECT_EQ(find(d, "k")->data, ...)` revienta (SEGV) si `find` devuelve `nullptr`. Guardar en una variable, `ASSERT_NE`, y luego usar.
+* `EXPECT_EQ` usa el `operator==` de `Value` (motivo para haberlo creado). Comparar direcciones también vale: `EXPECT_EQ(item, &entries[0].second)` comprueba que `find` no devuelve una copia.
+
+### 5. Tests escritos (grupo `Find`, 7 tests)
+| Test | Qué protege |
+|---|---|
+| `ReturnsValueForExistingKey` | el caso normal |
+| `ReturnsNullForMissingKey` | "no encontrado" es habitual |
+| `ReturnsNullForEmptyDict` | caso límite: el bucle no da ninguna vuelta |
+| `ReturnsNullForNonDict` | string, entero y lista → `nullptr` (el `get_if`) |
+| `RequiresExactKeyMatch` | prefijo (`"len"`), más larga (`"lengthy"`), mayúsculas (`"Length"`) y vacía (`""`) no coinciden: comparación exacta, no "empieza por"/"contiene" (las claves bencode son bytes, `L` ≠ `l`) |
+| `FindsCorrectKeyAmongSeveral` | no devuelve siempre el primer elemento |
+| `ReturnsPointerIntoDictionary` | el puntero apunta dentro del diccionario, no a una copia (protege el `const auto&`) |
+* **Prueba de fuego:** romper un test a propósito (esperar 6 en vez de 5) para comprobar que los tests detectan fallos de verdad. Funcionó: 6 pasan, 1 falla, con resumen final.
+
+### 6. Compilar y ejecutar
+| Quiero... | Comando |
+|---|---|
+| configurar (primera vez, tras borrar `build/` o cambiar una opción) | `cmake -B build` (`-B` mayúscula) |
+| compilar todo | `cmake --build build` |
+| compilar solo los tests | `cmake --build build --target btclient_tests` |
+| compilar solo el cliente | `cmake --build build --target bittorrent_client` |
+| ejecutar los tests (detallado, en color) | `./build/btclient_tests` |
+| ejecutar todos vía CMake | `ctest --test-dir build --output-on-failure` |
+* `--target X` compila X **y lo que necesite** (si cambia `bencode.cpp`, recompila `btcore` para los tests, no el cliente). La compilación es incremental.
+* **Ni `ctest` ni `./build/btclient_tests` compilan:** ejecutan el binario que hay en disco. Orden siempre: **compilar → ejecutar**.
+* Mientras se programa: ejecutable directo con filtros. Antes de un commit (y en CI): `ctest`.
+
+### 7. Elegir qué tests ejecutar
+| Comando | Qué hace |
+|---|---|
+| `./build/btclient_tests --gtest_list_tests` | lista sin ejecutar |
+| `--gtest_filter='Find.*'` | solo el grupo `Find` |
+| `--gtest_filter=Find.ReturnsNullForMissingKey` | un test concreto |
+| `--gtest_filter='*Null*'` | los que contengan "Null" |
+| `--gtest_filter='Find.*-*Missing*'` | los de `Find` menos los que contengan "Missing" |
+| `--gtest_brief=1` | solo muestra los que fallan |
+| `--gtest_repeat=100` | repite (fallos intermitentes) |
+| `--gtest_shuffle` | orden aleatorio (detecta tests dependientes entre sí) |
+| `--help` | todas las opciones |
+* Patrones: `*` = cualquier cosa, `:` separa patrones, `-` excluye. Entre comillas para que la terminal no interprete el `*`.
+* CTest: `ctest --test-dir build -R Find` (expresión regular), `-N` lista sin ejecutar.
+* VS Code: panel **Testing** (icono del matraz) con CMake Tools: ejecutar con un clic, ✗ roja en los que fallan.
+
+### 8. Leer un fallo de GoogleTest
+```
+bencode_test.cpp:11: Failure
+Expected equality of these values:
+  *item
+    Which is: 40-byte object <06-00 00-00 00-00 00-00 BE-BE ... 00-BE BE-BE ...>
+  btclient::Value{5}
+    Which is: 40-byte object <05-00 00-00 ... 00-00>
+```
+* Archivo y línea, el texto literal de cada lado y su valor.
+* **Volcado de bytes:** GoogleTest no sabe imprimir `Value`, así que muestra la memoria en hexadecimal:
+  * `40-byte object`: `sizeof(Value)` = 32 bytes de almacenamiento (la alternativa más grande, `std::string` en libstdc++) + 1 byte de **índice del variant** + relleno de alineación.
+  * `06-00 00-00 00-00 00-00`: el `std::int64_t` 6 en **little-endian** (byte menos significativo primero).
+  * El `00` antes de los últimos `BE`: índice del variant = 0 → alternativa `std::int64_t`.
+  * `BE-BE...`: bytes nunca escritos. **ASan rellena la memoria recién reservada en el heap con `0xBE`** para delatar lecturas sin inicializar. `*item` vive en el heap (dentro del vector); el temporal `Value{5}` en la pila, a ceros.
+* **Pendiente:** enseñar a GoogleTest a imprimir `Value` con `PrintTo(const Value&, std::ostream*)`, reutilizando el futuro printer → los fallos mostrarán `6` vs `5`.
+
+### 9. Errores dentro de macros: `required from here`
+* `EXPECT_EQ(item, btclient::Value{5})` (puntero vs `Value`) da el error **dentro de `gtest.h`**: la comparación ocurre en el código de la macro.
+  ```
+  .../gtest/gtest.h:1399:11: error: no match for 'operator==' (operand types are 'const btclient::Value* const' and 'const btclient::Value')
+  .../tests/bencode_test.cpp:11:5:   required from here
+  ```
+* La línea `error:` dice **qué** (los tipos: con `*` es puntero); la línea **`required from here`** dice **dónde** en el código propio.
+
+### 10. `SCOPED_TRACE` y RAII
+```cpp
+{
+    SCOPED_TRACE("integer");
+    btclient::Value value{5};
+    EXPECT_EQ(btclient::find(value, "length"), nullptr);
+}
+```
+* Añade un texto a los mensajes de fallo producidos **mientras está activa**: desde su línea hasta el final del bloque `{ }`. En el fallo aparece `Google Test trace: bencode_test.cpp:50: integer`.
+* Un bloque `{ }` por caso: la traza solo vale dentro, y cada bloque puede reutilizar el nombre `value`.
+* **Por dentro:** crea un objeto local; su constructor apunta el mensaje en una lista interna y su destructor (al cerrar `}`) lo quita. Aprovechar la destrucción automática de un objeto al salir de su bloque se llama **RAII** (*Resource Acquisition Is Initialization*): así funcionan `std::vector`, `std::unique_ptr`, `std::lock_guard`, y así se gestionarán sockets y archivos.
+* Útil con varios casos parecidos en un test, en bucles sobre casos (decoder) y en funciones auxiliares de test.
+
+### 11. Construir `Value`s: conversiones implícitas
+* **Regla práctica: al meter algo en un `Value`, envolverlo siempre en `btclient::Value{...}`.**
+  ```cpp
+  btclient::Value dictionary{btclient::Dict{
+      {"length",  btclient::Value{5}},
+      {"comment", btclient::Value{std::string("bittorrent_client")}},
+  }};
+  ```
+  Un par por línea; la coma tras el último elemento está permitida (diffs más limpios al añadir otro).
+* `{"comment", std::string("...")}` en un `Dict` **no compila**: *"converting to 'std::pair<...>' from initializer list would use explicit constructor"* → haría falta convertir `std::string` en `Value`.
+* **Por qué `find(d, "length")` convierte solo y `Value` no:**
+  1. Una conversión implícita necesita un **constructor no `explicit` en el tipo de destino**. `std::string_view` tiene uno desde `const char*`; `Value` (agregado sin constructores) no tiene ninguno.
+  2. Como mucho **una conversión "de usuario" seguida**: `"texto"` → `std::string` → `variant` → `Value` serían varios saltos; C++ no los encadena en silencio.
+* `Value{"dummy"}` sí compila: las llaves rellenan `data`, y queda un solo salto (`"dummy"` → `variant`, que elige `std::string`). Escribir `std::string(...)` ahí es para no depender de que el variant adivine (en versiones antiguas un literal podía acabar en `bool`).
+
+| Expresión | ¿Compila? | Por qué |
+|---|---|---|
+| `find(d, "length")` (parámetro `string_view`) | ✅ | constructor de `string_view` desde `const char*` (1 salto) |
+| `Value{"dummy"}` | ✅ | las llaves rellenan `data`; `"dummy"` → `variant` (1 salto) |
+| `Value{std::string("dummy")}` | ✅ | igual, sin que el variant adivine |
+| `{"comment", std::string("...")}` en un `Dict` | ❌ | haría falta `std::string` → `Value`, y `Value` no tiene constructor |
+| `{"comment", btclient::Value{std::string("...")}}` | ✅ | el `Value` se construye explícitamente |
+* Con constructores en `Value`, la cuarta fila funcionaría: decisión pendiente para el decoder. Si aparece *"would use explicit constructor"* o *"no matching conversion"* → falta un `btclient::Value{...}`.
+
+### 12. Trampa de los vectores: `{}` vs `()`
+```cpp
+std::vector<int> a{5};   // [5]              (llaves → lista de elementos)
+std::vector<int> b(5);   // [0, 0, 0, 0, 0]  (paréntesis → tamaño)
+std::vector<int> c{};    // []
+```
+* `btclient::Dict{}` → constructor por defecto: vector vacío (`size() == 0`; normalmente `capacity() == 0`, sin reservar memoria hasta el primer elemento).
+
+### 13. VS Code: kit de CMake Tools e IntelliSense
+* **Kit:** qué compilador usa CMake Tools. Hasta elegirlo no configura nada e IntelliSense no recibe la configuración (por eso `<gtest/gtest.h>` salía en rojo).
+  * Comprobar antes que la ventana está en WSL (esquina inferior izquierda: `WSL: Ubuntu`).
+  * `Ctrl+Shift+P` → *CMake: Select a Kit* → GCC 15.2 (`[Scan for kits]` si no aparece; nunca `[Unspecified]`). Después *CMake: Configure* (salida en *Output → CMake/Build*).
+  * En versiones recientes el kit **no está en la barra inferior**: está en el **panel de CMake** (icono del triángulo con llave en la barra izquierda) → *Project Status* → *Kit*.
+  * Diagnóstico: *C/C++: Log Diagnostics* → debe mostrar el proveedor `ms-vscode.cmake-tools`, `c++20` y los includes de GoogleTest.
+  * Plan B: `CMAKE_EXPORT_COMPILE_COMMANDS ON` + `"C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json"`.
+* **Falso positivo restante:** `EXPECT_EQ(item, &entries[0].second)` subrayado con *"ninguna instancia de función sobrecargada EqHelper::Compare coincide... (..., `<tipo de error>`)"*. El motor de IntelliSense (EDG) no consigue resolver el tipo a través del tipo recursivo (`pair` con `Value` incompleto) y se rinde. GCC lo compila con `-Werror` y el test pasa → **manda el compilador**. Si se vuelve frecuente: clangd (analiza con Clang).
+
+### 14. Estado y siguientes pasos
+1. ✅ Infraestructura de tests (GoogleTest + CTest) y 7 tests de `find`.
+2. ⬜ Tests de `ValueEquality`: enteros iguales/distintos, entero vs string `"5"` (alternativas distintas), listas iguales (recursividad).
+3. ⬜ (Opcional) `BUILD_TESTING`, `BUILD_GMOCK OFF`.
+4. ⬜ Diseñar el decoder.
