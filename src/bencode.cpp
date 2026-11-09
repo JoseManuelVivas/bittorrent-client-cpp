@@ -11,5 +11,5 @@ namespace btclient {
             }
         }
         return nullptr;
-    } // namespace btclient
-}
+    }
+} // namespace btclient
