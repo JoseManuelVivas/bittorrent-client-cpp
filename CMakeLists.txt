@@ -70,3 +70,31 @@ target_link_libraries(bittorrent_client PRIVATE
     btcore
     btclient_options
 )
+
+# ----------------------------------------------------------------------------
+# Tests (GoogleTest)
+# ----------------------------------------------------------------------------
+# GoogleTest is downloaded at configure time instead of relying on a system
+# install. The release is pinned and verified by its SHA-256 hash, so the build
+# is reproducible and a tampered or corrupted archive is rejected.
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/releases/download/v1.18.0/googletest-1.18.0.tar.gz
+    URL_HASH SHA256=6e3191c1455468b3fc35a417fb565c1c5071aee1b7e7f85e30cf48a98d37d8b5
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(googletest)
+
+enable_testing()
+add_executable(btclient_tests
+    tests/bencode_test.cpp
+)
+target_link_libraries(btclient_tests PRIVATE
+    btcore
+    btclient_options
+    GTest::gtest_main
+)
+
+include(GoogleTest)
+gtest_discover_tests(btclient_tests)
