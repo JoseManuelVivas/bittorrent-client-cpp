@@ -6,6 +6,7 @@
 #include <string>
 #include <cstdint>
 #include <string_view>
+#include <stdexcept>
 
 namespace btclient {
     // Lists and dictionaries contain Values, so the type must be declared
@@ -27,4 +28,14 @@ namespace btclient {
     // a Dict or does not contain the key. The pointer refers to an element inside
     // `dictionary` and is only valid while it is alive and unmodified.
     [[nodiscard]] const Value* find(const Value& dictionary, std::string_view key);
+
+    // Thrown when the input is not valid bencode.
+    class DecodeError : public std::runtime_error {
+    public:
+        using runtime_error::runtime_error;
+    };
+
+    // Decodes a single bencoded value from `input`.
+    // Throws DecodeError if `input` is not valid bencode.
+    [[nodiscard]] Value decode(std::string_view input);
 } // namespace btclient
