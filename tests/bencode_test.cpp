@@ -93,3 +93,127 @@ TEST(Find, ReturnsPointerIntoDictionary) {
     ASSERT_NE(item, nullptr);
     EXPECT_EQ(item, &entries[0].second);
 }
+
+TEST(ValueEquality, EqualIntegersAreEqual) {
+    btclient::Value a{5};
+    btclient::Value b{5};
+
+    EXPECT_EQ(a, b);
+}
+
+TEST(ValueEquality, DifferentIntegersAreNotEqual) {
+    btclient::Value a{5};
+    btclient::Value b{6};
+
+    EXPECT_NE(a, b);
+}
+
+TEST(ValueEquality, EqualStringsAreEqual) {
+    btclient::Value a{std::string("string")};
+    btclient::Value b{std::string("string")};
+
+    EXPECT_EQ(a, b);
+}
+
+TEST(ValueEquality, DifferentStringsAreNotEqual) {
+    btclient::Value a{std::string("string1")};
+    btclient::Value b{std::string("string2")};
+
+    EXPECT_NE(a, b);
+}
+
+TEST(ValueEquality, IntegerIsNotEqualToString) {
+    btclient::Value a{5};
+    btclient::Value b{std::string("5")};
+
+    EXPECT_NE(a, b);
+}
+
+TEST(ValueEquality, EqualListsAreEqual) {
+    btclient::Value a{btclient::List{
+        btclient::Value{1},
+        btclient::Value{std::string("a")}
+    }};
+    btclient::Value b{btclient::List{
+        btclient::Value{1},
+        btclient::Value{std::string("a")}
+    }};
+
+    EXPECT_EQ(a, b);
+}
+
+TEST(ValueEquality, DifferentListsAreNotEqual) {
+    btclient::Value a{btclient::List{
+        btclient::Value{1},
+        btclient::Value{std::string("a")}
+    }};
+    btclient::Value b{btclient::List{
+        btclient::Value{1},
+        btclient::Value{std::string("b")}
+    }};
+
+    {
+        SCOPED_TRACE("same length");
+        EXPECT_NE(a, b);
+    }
+
+    {
+        SCOPED_TRACE("different length");
+        b.data = btclient::List{btclient::Value{1}};
+        EXPECT_NE(a, b);
+    }
+}
+
+TEST(ValueEquality, EmptyListIsNotEqualToEmptyDict) {
+    btclient::Value a{btclient::List{}};
+    btclient::Value b{btclient::Dict{}};
+
+    EXPECT_NE(a, b);
+}
+
+TEST(ValueEquality, EqualDictsAreEqual) {
+    btclient::Value a{btclient::Dict{{"a", btclient::Value{1}}}};
+    btclient::Value b{btclient::Dict{{"a", btclient::Value{1}}}};
+
+    EXPECT_EQ(a, b);
+}
+
+TEST(ValueEquality, DifferentDictsAreNotEqual) {
+    btclient::Value a{btclient::Dict{{"a", btclient::Value{1}}}};
+    btclient::Value b{btclient::Dict{{"b", btclient::Value{1}}}};
+
+    {
+        SCOPED_TRACE("same length, different key");
+        EXPECT_NE(a, b);
+    }
+
+    {
+        SCOPED_TRACE("same length, different value");
+        b.data = btclient::Dict{{"a", btclient::Value{2}}};
+        EXPECT_NE(a, b);
+    }
+
+    {
+        SCOPED_TRACE("different length");
+        b.data = btclient::Dict{
+            {"a", btclient::Value{1}},
+            {"b", btclient::Value{1}}
+        };
+        EXPECT_NE(a, b);
+    }
+}
+
+// Dict is a vector of pairs, so key order is significant. Valid bencode
+// requires sorted keys, so decoded dictionaries have a single canonical order.
+TEST(ValueEquality, DictKeyOrderMatters) {
+    btclient::Value a{btclient::Dict{
+        {"a", btclient::Value{1}},
+        {"b", btclient::Value{2}}
+    }};
+    btclient::Value b{btclient::Dict{
+        {"b", btclient::Value{2}},
+        {"a", btclient::Value{1}}
+    }};
+
+    EXPECT_NE(a, b);
+}
