@@ -1368,7 +1368,114 @@ Value decode(std::string_view input);
 * Error: excepción `DecodeError` (derivada de `std::runtime_error`).
 * El decoder solo tendrá `throw`; los `try/catch` los pondrán quienes lo usen (`main`, y GoogleTest con `EXPECT_THROW`).
 
-### 12. Estado y siguientes pasos
+### 12. Repaso de clases en C++
+#### Qué es una clase
+* Un **tipo propio** que agrupa **datos** (miembros) y **funciones** que trabajan con ellos (métodos):
+  ```cpp
+  class Contador {
+  public:
+      void incrementar() { valor_++; }      // método
+      int valor() const { return valor_; }  // const: no modifica el objeto
+
+  private:
+      int valor_ = 0;                       // dato miembro
+  };
+
+  Contador c;
+  c.incrementar();
+  c.valor();   // 1
+  ```
+* El `const` final de un método significa "no modifica el objeto" (el mismo que lleva `operator==`).
+
+#### `public` / `private`
+* `public:` → usable desde fuera (`c.incrementar()`). `private:` → solo desde los métodos de la clase (`c.valor_` desde fuera es error). Protege los datos internos.
+
+#### `class` vs `struct`
+* Son casi lo mismo; solo cambia lo que ocurre **si no se escribe nada**:
+
+| | `struct` | `class` |
+|---|---|---|
+| Miembros sin `public:`/`private:` | públicos | **privados** |
+| Herencia sin `public`/`private` | pública | **privada** |
+
+* Convención: `struct` para datos simples y todo público (`Value`); `class` cuando hay datos que proteger o comportamiento.
+
+#### Constructores
+* Método especial que se ejecuta al **crear** el objeto; se llama como la clase y no tiene tipo de retorno.
+  ```cpp
+  class Persona {
+  public:
+      Persona(std::string nombre) : nombre_(nombre) {}   // lista de inicialización
+  private:
+      std::string nombre_;
+  };
+
+  Persona p("Ana");
+  ```
+* `: nombre_(nombre)` es la **lista de inicialización**: inicializa los miembros antes de entrar en el cuerpo.
+
+#### Herencia: "es un"
+```cpp
+class Animal {
+public:
+    std::string nombre() const { return "animal"; }
+};
+
+class Perro : public Animal {};   // un Perro ES UN Animal
+
+Perro p;
+p.nombre();   // "animal": Perro tiene todo lo de Animal
+```
+* La clase derivada hereda todo lo de la base y puede añadir lo suyo.
+* **Herencia `public`:** todo el mundo sabe que un `Perro` es un `Animal` → se puede pasar donde se espera un `Animal&`, y un `catch (const std::exception&)` captura un `DecodeError`.
+* **Herencia privada** (lo que pasa en una `class` si no se escribe `public`): `Perro` tiene lo de `Animal` por dentro, pero hacia fuera **no es** un `Animal`.
+
+#### Heredar constructores con `using`
+* Los constructores **no se heredan** automáticamente. Dos formas:
+  ```cpp
+  class Perro : public Animal {
+  public:
+      Perro(std::string nombre) : Animal(nombre) {}   // a mano: se lo pasa al de la base
+  };
+
+  class Perro : public Animal {
+  public:
+      using Animal::Animal;                           // C++11: hereda todos los de la base
+  };
+  ```
+
+#### Aplicado a `DecodeError`
+```cpp
+#include <stdexcept>
+
+// Thrown when the input is not valid bencode.
+class DecodeError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+```
+* **Error del primer intento:** `class DecodeError : std::exception {};`
+  1. **Herencia privada** (falta `public`): un `catch (const std::exception&)` **no la capturaría** → la red de `main` fallaría y el programa terminaría abruptamente.
+  2. **`std::exception` no guarda un mensaje** (su `what()` es genérico). `std::runtime_error` guarda el mensaje del constructor y lo devuelve con `what()`, y es la categoría correcta (error de datos).
+  3. **Sin constructor que acepte el mensaje**: `using std::runtime_error::runtime_error;` (en la sección `public:`, porque en una `class` todo es privado por defecto).
+* Con esto: `throw DecodeError("invalid integer");` funciona, `e.what()` devuelve el mensaje y `catch (const std::exception&)` la captura.
+* Comprobación rápida: `EXPECT_THROW(throw btclient::DecodeError("test"), std::exception);`.
+* Dentro de la clase, `using runtime_error::runtime_error;` (sin `std::`) también vale: el nombre de la base es visible.
+* **A futuro:** añadir un miembro con la **posición** del fallo ("invalid integer at byte 312").
+
+#### Revisión del header
+* Declarar `DecodeError` **antes** de `decode`: el tipo de error aparece antes que la función que lo lanza.
+* **Documentar el contrato** de `decode`, sobre todo que lanza:
+  ```cpp
+  // Decodes a single bencoded value from `input`.
+  // Throws DecodeError if `input` is not valid bencode.
+  [[nodiscard]] Value decode(std::string_view input);
+  ```
+* `[[nodiscard]]` en `decode`: decodificar sin usar el resultado no tiene sentido.
+* Sangría de `public:`: al mismo nivel que `class` (o con 1 espacio, estilo Google), y el contenido con 4 más.
+* `decode` declarada pero sin implementar compila mientras nadie la llame (fallaría al enlazar al usarla).
+
+### 13. Estado y siguientes pasos
 1. ✅ Tests de `Value` (`find` e igualdad): 18 tests.
-2. ✅ Firma del decoder: `std::string_view` → `Value`, errores con `DecodeError`.
+2. ✅ Firma del decoder: `std::string_view` → `Value`, errores con `DecodeError` (declarados en `bencode.h`).
 3. ⬜ Paso 1 del decoder: enteros correctos (`i42e`, `i0e`, `i-7e`), con los tests primero.
