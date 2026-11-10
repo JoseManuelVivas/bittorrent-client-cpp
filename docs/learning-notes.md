@@ -1082,6 +1082,293 @@ std::vector<int> c{};    // []
 
 ### 14. Estado y siguientes pasos
 1. ✅ Infraestructura de tests (GoogleTest + CTest) y 7 tests de `find`.
-2. ⬜ Tests de `ValueEquality`: enteros iguales/distintos, entero vs string `"5"` (alternativas distintas), listas iguales (recursividad).
+2. ✅ Tests de `ValueEquality`. *(Ver entrada siguiente.)*
 3. ⬜ (Opcional) `BUILD_TESTING`, `BUILD_GMOCK OFF`.
-4. ⬜ Diseñar el decoder.
+4. 🚧 Diseñar el decoder.
+
+---
+
+## [2026-11-10] Tests de igualdad, diseño del decoder y bytes con signo
+
+### 1. Tests de `ValueEquality` (11 tests)
+* **Qué se prueba:** el `operator==` de `Value`. `EXPECT_EQ(a, b)` evalúa por dentro `a == b`; `EXPECT_NE(a, b)` evalúa `a != b`, que en C++20 el compilador genera automáticamente a partir de `==`.
+  * `EXPECT_TRUE(a == b)` haría lo mismo, pero al fallar solo dice "expected true"; `EXPECT_EQ` muestra los dos valores.
+* **¿Por qué probar un `= default`?** Su comportamiento depende de cosas invisibles en esa línea: cómo compara `std::variant` (alternativa y valor), que sea recursivo a través de `List`/`Dict`, que el orden de `Dict` importe. Además, los tests del decoder usarán `EXPECT_EQ` entre `Value`s: si `==` fallara, darían por buenos resultados erróneos. Y protegen frente a cambios futuros (un `==` escrito a mano, `Dict` → `std::map`).
+* **Cobertura:** las cuatro alternativas (enteros, strings, listas, diccionarios), alternativas distintas con "mismo valor" (`5` vs `"5"`; `List{}` vs `Dict{}`), recursividad (listas con elementos) y orden de claves.
+
+| Test | Qué comprueba |
+|---|---|
+| `EqualIntegersAreEqual` / `DifferentIntegersAreNotEqual` | `5 == 5`, `5 != 6` |
+| `EqualStringsAreEqual` / `DifferentStringsAreNotEqual` | `"string" == "string"`, `"string1" != "string2"` |
+| `IntegerIsNotEqualToString` | `5 != "5"`: el `==` compara también la **alternativa** |
+| `EqualListsAreEqual` / `DifferentListsAreNotEqual` | `[1, "a"]` igual a sí misma; distinta de `[1, "b"]` y de `[1]` |
+| `EmptyListIsNotEqualToEmptyDict` | dos "vacíos" de tipos distintos |
+| `EqualDictsAreEqual` / `DifferentDictsAreNotEqual` | distinta clave, distinto valor, distinta longitud |
+| `DictKeyOrderMatters` | `{"a":1,"b":2} != {"b":2,"a":1}` |
+
+* **Regla: en un test de "son distintos", cambiar una sola cosa.** `{"a":1}` vs `{"b":2}` cambia clave y valor a la vez: pasaría aunque `==` solo mirase las claves. Separado en "misma longitud, distinta clave" (`{"a":1}` vs `{"b":1}`) y "misma longitud, distinto valor" (`{"a":1}` vs `{"a":2}`), cada caso demuestra exactamente qué comprueba.
+* **`EXPECT_NE` aquí sí es lo correcto:** lo que se quiere comprobar es precisamente la diferencia (excepción a "preferir `EXPECT_EQ` con el valor exacto").
+* **Los tests también documentan decisiones de diseño:** `DictKeyOrderMatters` deja por escrito (con comentario) que el orden importa porque `Dict` es un vector, y que es correcto porque el bencode válido exige claves ordenadas. Si alguien cambia `Dict` por `std::map`, el test falla y le obliga a pensar si es intencionado.
+* **Estilo:** `a`/`b` (o `lhs`/`rhs`) como nombres en tests de igualdad; etiquetas de `SCOPED_TRACE` coherentes; `std::string("...")` explícito aunque un literal también funcionaría (solo `std::string` puede construirse desde `const char*` entre las cuatro alternativas), por claridad y para no depender de la deducción del variant.
+* **Comprobaciones antes de un commit:** `ctest --test-dir build` y `git diff --check` (detecta espacios sobrantes y problemas de formato).
+
+### 2. Qué tiene que hacer el decoder
+* Lo contrario de crear un `.torrent`: **bytes bencode → árbol de `Value`s**.
+  ```
+  "d6:lengthi5e4:name4:spame"  →  Value{ Dict{ {"length", 5}, {"name", "spam"} } }
+  ```
+* **Reglas (BEP 3):** el primer byte indica el tipo.
+
+| Primer byte | Tipo | Formato | Ejemplo | Resultado |
+|---|---|---|---|---|
+| `i` | entero | `i` + número + `e` | `i42e` | `42` |
+| `0`–`9` | string | longitud + `:` + bytes | `4:spam` | `"spam"` |
+| `l` | lista | `l` + valores + `e` | `l4:spami42ee` | `["spam", 42]` |
+| `d` | diccionario | `d` + (clave, valor)... + `e` | `d3:cow3:mooe` | `{"cow": "moo"}` |
+
+* **Funcionamiento:** lleva una **posición** en el buffer; mira el byte actual, decide qué tipo empieza ahí, lo lee entero y avanza. Para cada elemento de una lista o diccionario **se llama a sí mismo** (recursivo, como `Value`).
+  ```
+  l4:spami42ee
+  ^              'l' → lista; avanzo y leo valores hasta 'e'
+   ^             '4' → string de longitud 4; salto ':'
+     ^^^^        4 bytes: "spam"
+         ^       'i' → entero hasta 'e': 42
+             ^   'e' → fin de la lista → ["spam", 42]
+  ```
+* **Lo difícil: rechazar entrada inválida sin romperse nunca** (los datos vienen de fuera y pueden estar corruptos o manipulados):
+  * **Truncados:** `i42` (falta `e`), `10:spam` (longitud que miente → *buffer overflow* si no se valida), `l4:spam` (lista sin cerrar).
+  * **Formato inválido:** `i4x2e`, `i-0e` (prohibido), `i03e` (ceros a la izquierda prohibidos; solo `i0e`), `ie` (vacío), `x` (no inicia ningún tipo).
+  * **Diccionarios:** claves que no son strings (`di1ei2ee`), claves desordenadas o repetidas.
+  * **Números que no caben:** `i99999999999999999999e` (no cabe en `std::int64_t`), longitudes absurdas.
+  * **Basura al final:** `i42eXYZ`. Un `.torrent` debe ser exactamente **un** valor.
+  * **Anidamiento malicioso:** `llll...` un millón de veces → una llamada recursiva por nivel → *stack overflow*. Hace falta un **límite de profundidad**.
+* **Info hash (a futuro):** el decoder tendrá que poder indicar dónde empezaba y terminaba el diccionario `info` en el buffer (SHA-1 sobre los bytes originales).
+
+### 3. Plan incremental (divide y vencerás)
+1. Enteros correctos (`i42e`, `i0e`, `i-7e`).
+2. Enteros mal formados, un test por error.
+3. Strings y sus errores.
+4. Listas (aparece la recursividad, reutilizando enteros y strings).
+5. Diccionarios y validación de claves ordenadas/únicas.
+6. Extras: basura al final, límite de profundidad, y decodificar el `.torrent` de Debian.
+* Cada paso es pequeño y se prueba antes del siguiente. Las partes difíciles de C++ ya están superadas; el decoder es sobre todo **lógica**.
+
+### 4. Cómo se trabaja en proyectos grandes
+* **Desarrollo incremental:** versión mínima que funciona, ampliada en pasos pequeños, cada uno probado (el roadmap por fases).
+* **TDD (*Test-Driven Development*):** 🔴 escribir un test de algo que no existe (falla) → 🟢 código mínimo para que pase → 🔵 refactor sin cambiar comportamiento (los tests vigilan). Repetir.
+* **Cambios pequeños:** commits y Pull Requests que hacen una sola cosa (una PR de 50 líneas se revisa; una de 3.000, no).
+* **Interfaces primero:** decidir cómo encajan las piezas permite construirlas y probarlas por separado (o en paralelo, por personas distintas).
+* **Separar responsabilidades:** decoder vs printer, `btcore` vs ejecutable.
+* En una entrevista, "¿cómo abordarías un problema grande?" → descomponer hasta que cada trozo sea pequeño, comprensible y comprobable.
+
+### 5. Interfaz pública vs interna
+* **Pública** (el header; la usan el programa y los tests): una sola función "bytes → `Value`". Se decide **ya**, porque no cambia al añadir tipos: `decode("i42e")` y `decode("4:spam")` usan la misma función, así que los tests de los primeros pasos siguen valiendo al final.
+* **Interna** (`bencode.cpp`, privada): funciones auxiliares ("leer entero", "leer string") y cómo llevan la posición. Se construye y reorganiza por pasos; los tests sobre la interfaz pública avisan si un refactor rompe algo.
+
+### 6. Decisiones de la firma
+* **Entrada: `std::string_view`.** Vista sin copias y de solo lectura del buffer que posee quien llama; permite `decode("i42e")` en los tests.
+  * Alternativa vista en otros proyectos: `std::span<const std::byte>` (C++20), más explícito para datos binarios pero incómodo (no acepta literales, comparar con `'i'` requiere conversiones). Para bencode, cuya estructura es ASCII, `string_view` es lo práctico.
+* **El resultado no depende del buffer:** `Value` guarda los strings como `std::string` (dueños), así que el decoder los **copia**. Tras `decode`, el buffer puede destruirse sin *dangling*. Coste: copiar (p. ej. los 26800 bytes de `pieces`). Alternativa: guardar `string_view` (cero copias, pero el árbol solo vale mientras viva el buffer). Para un `.torrent` de pocos KB, copiar es lo sensato.
+* **Salida: devolver el `Value`, no un parámetro de salida.**
+  * Estilo C: `bool decode(std::string_view input, Value& out);`. Existía para evitar copias (pre-C++11) y para devolver a la vez el resultado y si hubo error.
+  * Estilo moderno: `Value decode(std::string_view input);`. Sin coste gracias a:
+    * **RVO** (*Return Value Optimization*): el compilador construye el resultado directamente en la variable de quien llama (garantizado por el estándar en muchos casos desde C++17).
+    * **Move semantics** (C++11): si no hay RVO, el objeto se **mueve**; mover un `std::vector`/`std::string` solo traspasa su puntero interno, sin copiar elementos.
+  * Ventajas: se lee mejor (`auto torrent = decode(bytes);`), no hay `Value` a medio rellenar si algo falla, se puede encadenar (`find(decode(bytes), "info")`). Lo recomiendan las C++ Core Guidelines.
+* **Pendiente: cómo informar de errores** si la función solo devuelve un `Value`:
+  1. Lanzar una excepción.
+  2. `std::optional<Value>`: un valor o nada (no dice **por qué** falló).
+  3. Un tipo "resultado o error" (`std::expected` es C++23; el proyecto usa C++20).
+
+### 7. `char` es un número (y puede ser negativo)
+* `char` es un **tipo entero de 1 byte**; no existe un "tipo carácter" aparte. `'a'` es el número 97. Que se vea como letra o número depende del uso: `std::cout << c` lo interpreta como carácter; `int n = c;`, `c + 1` o `c == 'a'` lo usan como número.
+* **Con o sin signo:** `unsigned char` va de 0 a 255; `signed char` de -128 a 127. El `char` a secas es **una u otra según la plataforma**: con signo en GCC/x86 (este proyecto), normalmente sin signo en ARM.
+* **Bytes ≥ 128 se ven como negativos** en un `char` con signo. El byte en memoria es idéntico; cambia la interpretación:
+
+| Byte | Como `unsigned char` | Como `char` (GCC x86) |
+|---|---|---|
+| `0x41` (`A`) | 65 | 65 |
+| `0x7F` | 127 | 127 |
+| `0x80` | 128 | -128 |
+| `0xBE` | 190 | -66 |
+| `0xFF` | 255 | -1 |
+
+* Aparecen en los hashes de `pieces`, en los mensajes binarios de los peers y en los datos de las piezas.
+* **Cuándo es un problema** (al usar el `char` como número):
+  1. **Funciones que esperan `int`**: `std::isdigit(c)` solo acepta 0-255 o `EOF`; con `-66` es **comportamiento indefinido** (muchas implementaciones indexan una tabla → `tabla[-66]`).
+  2. **Índices de arrays**: `conteo[c]++` con `c` negativo escribe fuera del array.
+  3. **Montar enteros a partir de bytes** (longitudes big-endian del protocolo de peers): con `<<`, un byte ≥ 128 se promociona a un `int` negativo y la **extensión de signo** contamina los bits altos → una longitud de 200 puede salir negativa o enorme. Bug clásico en clientes de red.
+* **No es problema** comparar con caracteres ASCII: `c >= '0' && c <= '9'`, `c == 'i'` (todos positivos; un byte negativo nunca coincide). Detectar dígitos así es seguro.
+* **Protección:** antes de usar un byte como número, `static_cast<unsigned char>(c)` (p. ej. `std::isdigit(static_cast<unsigned char>(c))`). `-Wsign-conversion` y UBSan ayudan a detectar estos casos.
+
+### 8. Tipos para datos binarios
+* Para datos **puramente binarios** (hashes, mensajes de peers, contenido de piezas): **`std::uint8_t`** en lugar de `char`.
+  * Siempre de 0 a 255 en cualquier plataforma: sin problemas de signo ni de extensión de signo.
+  * Comunica "esto es un byte", no texto.
+  * Los desplazamientos funcionan como se espera al montar enteros big-endian.
+* **Frontera:** bencode sigue con `char`/`std::string_view` (estructura ASCII) y `pieces` queda en el `Value` como `std::string` con los bytes tal cual. Al extraer los hashes para usarlos, se convierten a `std::array<std::uint8_t, 20>`, y a partir de ahí el código de piezas y red trabaja con `std::uint8_t`.
+* **Trampa:** `std::uint8_t` es un alias de `unsigned char` y `std::cout` lo imprime como **carácter** (`65` → `A`). Para depurar: `static_cast<int>(b)` o hexadecimal.
+* **Alternativa estricta: `std::byte` (C++17).** Byte "puro": no permite aritmética, solo operaciones de bits; su valor se obtiene con `std::to_integer<int>(b)`. Más seguro conceptualmente, más incómodo. `std::uint8_t` es la opción pragmática habitual en código de red.
+
+| Datos | Tipo |
+|---|---|
+| Estructura bencode (texto ASCII) | `char`, `std::string_view` |
+| Strings dentro de `Value` (incluido `pieces`) | `std::string` (bytes tal cual) |
+| Un hash SHA-1 | `std::array<std::uint8_t, 20>` |
+| Buffers binarios (mensajes, piezas) | `std::vector<std::uint8_t>` |
+| Vista de un buffer binario | `std::span<const std::uint8_t>` |
+
+### 9. Estrategia de errores: por qué no un "valor de error"
+* **Valor centinela** (*sentinel value*): un valor especial que significa "error". Es lo que hace C (`fopen` → `NULL`, `read` → `-1`) y lo que hace `find` (`nullptr` = no encontrado).
+* **Funciona en `find`** porque `nullptr` no es un puntero válido a ningún `Value`: no puede chocar con un resultado real.
+* **No sirve para el decoder:**
+  1. **Reservar un `Value` existente** (p. ej. `Value{-1}` o un string vacío): en bencode **todos son datos válidos** (`i-1e`, `0:`). No hay forma de distinguir un error de un dato real.
+  2. **Añadir una alternativa `DecodeError` al `variant`:** no choca, pero:
+     * "Error" pasa a ser un tipo de dato bencode y no lo es. Se propaga a **todo el árbol** (una lista podría contener un error), y todo el código que use `Value` (`find`, el printer, `==`, el lector del `.torrent`) tendría que contemplarlo aunque los datos ya sean válidos.
+     * **Es fácil olvidarse de comprobarlo:** el compilador no obliga, y el fallo aparece más tarde y en otro sitio (el gran problema de los centinelas en C).
+* **La intuición correcta:** "lo que devuelvo es *o* un resultado *o* un error". El fallo era **dónde** ponerlo: el "o" va **por fuera** de `Value`, no dentro:
+  ```
+  decode  →  [ un Value  |  un error ]
+  ```
+  Así `Value` sigue significando "dato bencode válido" en todo el programa.
+* **Opciones:**
+  1. **Excepción:** `Value decode(std::string_view)`; si falla, lanza.
+  2. **`std::optional<Value>`:** un valor o nada. No dice **por qué** ni **dónde** falló (un parser necesita "longitud inválida en el byte 312").
+  3. **Resultado o error:** tipo con un `Value` o un error con mensaje y posición. `std::expected` es C++23; en C++20 habría que escribirlo o usar una librería.
+* **Decisión: excepciones.**
+  * El decoder es **recursivo**: un error en un entero dentro de una lista dentro de un diccionario **sube solo** hasta `decode`. Con `optional`/resultado, cada llamada recursiva tendría que comprobar y propagar el error a mano.
+  * Un archivo corrupto es una situación **excepcional**, justo para lo que existen.
+  * GoogleTest tiene `EXPECT_THROW`.
+
+### 10. Excepciones en C++
+* **Idea:** "aquí ha pasado algo que no sé resolver; que se encargue alguien de más arriba". La función **lanza** un objeto que describe el problema y la ejecución **salta** al sitio que lo **captura**, saltándose todo lo que hay en medio.
+```cpp
+#include <stdexcept>
+
+int dividir(int a, int b) {
+    if (b == 0) {
+        throw std::runtime_error("division by zero");   // lanzar
+    }
+    return a / b;
+}
+
+int main() {
+    try {                                    // bloque que puede fallar
+        int r = dividir(10, 0);
+        std::cout << r << '\n';              // nunca se ejecuta
+    } catch (const std::runtime_error& e) {  // qué hacer si falla
+        std::cerr << "Error: " << e.what() << '\n';
+    }
+}
+```
+* `throw` crea el error y **termina la función en ese instante** (no devuelve nada). `try { }` marca el código que puede fallar. `catch (const T& e)` se ejecuta solo si se lanzó un `T`. `e.what()` devuelve el mensaje.
+
+#### Cómo sube una excepción (comprobado compilando)
+```cpp
+void nivel3() { throw std::runtime_error("algo ha fallado"); }
+void nivel2() { nivel3(); std::cout << "nivel2 sigue\n"; }
+void nivel1() { nivel2(); std::cout << "nivel1 sigue\n"; }
+
+int main() {
+    try {
+        nivel1();
+        std::cout << "main sigue dentro del try\n";
+    } catch (const std::exception& e) {
+        std::cerr << "capturado: " << e.what() << '\n';
+    }
+    std::cout << "main continua despues del catch\n";
+}
+```
+Salida:
+```
+capturado: algo ha fallado
+main continua despues del catch
+```
+* Se salta **todo** el código desde el `throw` hasta el `catch`, en todas las funciones intermedias (ningún `"... sigue"` se imprime, tampoco el resto del `try`).
+* `catch (const std::exception&)` captura un `std::runtime_error` porque hereda de él.
+* **Después del `catch`, el programa sigue con normalidad**: la excepción ya está resuelta.
+* `nivel1` y `nivel2` **no hacen nada especial**: ni comprueban ni propagan. Ideal para el decoder recursivo:
+  ```
+  decode
+   └─ leer diccionario
+       └─ leer lista
+           └─ leer entero  →  throw "invalid integer"
+  decode  ←──── salta directo ──┘
+  ```
+
+#### `throw` sin `try/catch`, y dónde va cada uno
+* **Un `throw` no necesita un `try/catch` en la misma función** (lo habitual es que no lo tenga). La función que detecta el problema no sabe qué hacer con él, así que solo avisa.
+* **Una excepción siempre sube.** El `try/catch` no hace que el código "pueda lanzar": es una **red** que se pone en un punto concreto para pararla ahí. `nivel1` y `nivel2`, sin `try`, también se vieron afectadas.
+* **Condición:** el `throw` tiene que ocurrir **durante la ejecución** de algún bloque `try` (a cualquier profundidad) con un `catch` del tipo adecuado. No hace falta que esté escrito dentro del `try`: basta con que se ejecute mientras el `try` está activo (p. ej. `dividir` llamada desde el `try` de `main`).
+
+| ¿Dónde está el `throw`? | ¿Qué pasa? |
+|---|---|
+| Durante un `try` con un `catch` que encaja | sale del `try`, ejecuta el `catch` y sigue después |
+| Durante un `try` cuyo `catch` no encaja con el tipo | sigue subiendo hasta el siguiente `try` de más arriba |
+| Sin ningún `try` que la capture en toda la cadena | el programa termina abruptamente (`std::terminate`) |
+
+  Sin captura, el programa muestra algo como `terminate called after throwing an instance of 'std::runtime_error' what(): division by zero` y aborta.
+* **Regla:** lanzar donde se **detecta** el problema; capturar donde se puede **hacer algo útil** con él (normalmente mucho más arriba). `main` suele tener un `try/catch` alrededor de todo como **última red**: si algo falla y nadie lo resolvió antes, al menos se muestra un mensaje claro.
+* **Analogía de la empresa:** director → jefe → encargado → empleado. El empleado encuentra un problema que no sabe resolver, para y avisa hacia arriba (`throw`). El encargado y el jefe, sin protocolo, dejan su trabajo a medias y lo pasan. El director tiene un protocolo (`try/catch`), lo resuelve y la empresa sigue. Si nadie tiene protocolo, la empresa cierra (`std::terminate`).
+
+#### Stack unwinding (RAII)
+* Mientras la excepción sube, C++ **destruye todas las variables locales** de las funciones que abandona (*stack unwinding*): los `std::vector`/`std::string` a medio construir liberan su memoria. Es el mismo mecanismo que `SCOPED_TRACE` (su destructor se ejecuta al salir del bloque, de forma normal o por excepción). Gracias a RAII, las excepciones no provocan fugas en C++ moderno.
+* Lo único que se ejecuta durante el salto son esos destructores.
+
+#### Tipos de excepciones (`<stdexcept>`)
+```
+std::exception                ← base de todas; tiene what()
+ ├─ std::logic_error          ← errores del programador (un bug)
+ │   ├─ std::invalid_argument
+ │   └─ std::out_of_range
+ └─ std::runtime_error        ← errores de los datos o del entorno
+```
+* Un bencode corrupto es un error de **datos** → derivar de `std::runtime_error` una clase propia:
+  ```cpp
+  class DecodeError : public std::runtime_error {
+  public:
+      using std::runtime_error::runtime_error;   // reutiliza sus constructores
+  };
+
+  throw DecodeError("invalid integer");
+  ```
+  * Quien capture `std::exception` también la captura, y tiene `what()`.
+  * Permite capturar **solo** los errores de decodificación y añadirles información (p. ej. la **posición** del fallo).
+
+#### Reglas de uso
+* **Capturar por referencia constante** (`catch (const DecodeError& e)`): por valor se copiaría y, con un tipo derivado, se "recortaría" (*slicing*) perdiendo información.
+* **El orden de los `catch` importa:** se elige el primero que encaje → los tipos concretos antes que los generales (`DecodeError` antes que `std::exception`).
+* **Coste:** si no se lanza, prácticamente **cero** (diseño "zero-cost"); lanzar es caro (decenas de microsegundos). → Solo para situaciones **excepcionales**, no para el flujo normal. Un `.torrent` corrupto es excepcional (lanza); que `find` no encuentre una clave es normal (devuelve `nullptr`).
+
+#### En GoogleTest
+```cpp
+EXPECT_THROW(btclient::decode("i42"), btclient::DecodeError);   // espera que lance ese tipo
+EXPECT_NO_THROW(btclient::decode("i42e"));                      // espera que no lance
+```
+`EXPECT_THROW` es una red que pone GoogleTest y que comprueba que la excepción sí llega.
+
+| Concepto | Qué es |
+|---|---|
+| `throw X` | lanza `X` y abandona la función |
+| `try { }` | bloque cuya ejecución se vigila |
+| `catch (const T& e)` | captura errores de tipo `T` |
+| `e.what()` | mensaje del error |
+| *stack unwinding* | al subir, se destruyen las variables locales |
+| `std::runtime_error` | base para errores de datos o del entorno |
+| clase propia (`DecodeError`) | distinguir los errores propios y añadirles información |
+| `EXPECT_THROW` / `EXPECT_NO_THROW` | probarlas en GoogleTest |
+
+### 11. Firma decidida del decoder
+```cpp
+// Lanza DecodeError si la entrada no es bencode válido.
+Value decode(std::string_view input);
+```
+* Entrada: `std::string_view` (vista sin copias, solo lectura).
+* Salida: el `Value` por valor (RVO / move).
+* Error: excepción `DecodeError` (derivada de `std::runtime_error`).
+* El decoder solo tendrá `throw`; los `try/catch` los pondrán quienes lo usen (`main`, y GoogleTest con `EXPECT_THROW`).
+
+### 12. Estado y siguientes pasos
+1. ✅ Tests de `Value` (`find` e igualdad): 18 tests.
+2. ✅ Firma del decoder: `std::string_view` → `Value`, errores con `DecodeError`.
+3. ⬜ Paso 1 del decoder: enteros correctos (`i42e`, `i0e`, `i-7e`), con los tests primero.
