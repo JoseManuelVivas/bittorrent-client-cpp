@@ -1682,4 +1682,86 @@ TEST(DecodeInteger, RejectsMissingTerminator) {
 
 ### 14. Estado y siguientes pasos
 1. ✅ Paso 1: `decode_integer` + `decode`; 3 tests `DecodeInteger` (21 en total) en verde.
-2. ⬜ Paso 2: tests `Rejects...` y extremos, validaciones en `decode_integer`.
+2. 🚧 Paso 2: tests `Rejects...` y extremos, validaciones en `decode_integer`. *(Ver entrada siguiente.)*
+
+---
+
+## [2026-11-12] Decoder, paso 2 (ronda 1): lo que devuelve `from_chars`
+
+### 1. Qué devuelve `std::from_chars`
+```cpp
+std::int64_t number{};
+const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), number);
+```
+Tres informaciones:
+1. **El número** → no se devuelve: se **escribe** en el tercer argumento (por referencia). **Si falla, no lo toca** (conserva su valor anterior).
+2. **`ec`** (`std::errc`, en `<system_error>`) → ¿hubo error?
+   * `std::errc{}` → ningún error.
+   * `std::errc::invalid_argument` → al principio no hay ningún número que leer.
+   * `std::errc::result_out_of_range` → hay un número, pero no cabe en el tipo.
+3. **`ptr`** → puntero al **primer carácter no usado**. Si leyó todo, `ptr == fin`.
+
+**Comprobado con un programa de prueba** (`number` empieza en 999 para ver si se modifica):
+
+| Entrada | `ec` | Leído | `number` | |
+|---|---|---|---|---|
+| `"42"` | ok | 2/2 | 42 | ✅ |
+| `"-7"` | ok | 2/2 | -7 | ✅ entiende el `-` |
+| `""` | `invalid_argument` | 0/0 | 999 | ❌ nada que leer; no toca `number` |
+| `"-"` | `invalid_argument` | 0/1 | 999 | ❌ `-` sin dígitos |
+| `"+5"` | `invalid_argument` | 0/2 | 999 | ❌ no acepta `+` |
+| `"4x2"` | **ok** | **1/3** | 4 | ⚠️ "éxito" pero solo leyó el `4` |
+| `"9223372036854775808"` | `result_out_of_range` | 19/19 | 999 | ❌ no cabe; no toca `number` |
+| `"03"` | **ok** | 2/2 | 3 | ⚠️ válido para él |
+| `"-0"` | **ok** | 2/2 | 0 | ⚠️ válido para él |
+
+* **Por qué este diseño:** muy rápido, sin excepciones, sin reservar memoria y sin depender del *locale*. A cambio, **comprobar el resultado es responsabilidad de quien llama**: si se ignora, los errores pasan en silencio (antes de esta ronda, `ie` devolvía `Value{0}` porque `number` se quedaba en 0).
+
+### 2. El struct de resultado y los *structured bindings*
+* Lo que devuelve es un struct, en esencia:
+  ```cpp
+  struct from_chars_result {
+      const char* ptr;   // 1er campo
+      std::errc   ec;    // 2º campo
+  };
+  ```
+* **Forma 1, el struct entero:** `auto result = std::from_chars(...);` → `result.ptr`, `result.ec` (como `entry.first`/`entry.second`).
+* **Forma 2, *structured bindings* (C++17):** `auto [ptr, ec] = std::from_chars(...);` → "desempaqueta" los campos en dos variables sueltas. Hace lo mismo.
+* **Importa el orden, no los nombres:** se asignan **por posición** según la declaración del struct. `auto [ec, ptr]` compilaría con los nombres **cambiados** (`ec` sería el puntero). En `from_chars`: primero `ptr`, luego `ec`.
+* `const auto [ptr, ec]` si no se van a modificar.
+* En unos *structured bindings* basta con usar **una** de las variables para que no haya aviso de variable sin usar.
+
+### 3. Ronda 1: comprobar `ec`
+```cpp
+if (ec == std::errc::result_out_of_range) {
+    throw DecodeError("integer out of range");
+}
+if (ec != std::errc{}) {
+    throw DecodeError("invalid integer");
+}
+```
+* Mensajes **concretos**: `"no number"` describía `ie` pero no `i+5e` ni el overflow. Distinguir el overflow ayuda a diagnosticar un `.torrent` real.
+* `#include <system_error>` en `bencode.cpp` por `std::errc` (aunque `<charconv>` ya lo incluya por dentro).
+* Tests: `RejectsMissingTerminator` (`i7`, ya pasaba por el `npos`), `RejectsEmptyInteger` (`ie`), `RejectsLoneMinusSign` (`i-e`), `RejectsPlusSign` (`i+5e`), `RejectsOverflow` (`i9223372036854775808e`, con un comentario que explica el número). 8 tests en `DecodeInteger`, 26 en total.
+
+### 4. Por qué una sola comprobación hace pasar cuatro tests
+* Los cuatro casos son **entradas distintas con la misma causa de fallo**: `from_chars` ya detecta los cuatro y lo indica en `ec`; el código solo ignoraba esa señal. Un solo `if` que la mira los cubre todos.
+* Es normal en TDD: los tests se escriben pensando en **el comportamiento** (qué entradas deben rechazarse), no en cómo se implementará. A veces una línea resuelve varios; a veces un test necesita su propia comprobación (ronda 2: `i4x2e`; ronda 4: `i-0e`, `i03e`).
+* **No sobran tests por ello:** cada uno protege una regla distinta. Si mañana se cambia `from_chars` por otra forma de convertir (o se añade un caso especial), un test que antes "pasaba gratis" puede fallar y avisar. Los tests documentan **qué** debe cumplirse, independientemente del **cómo**.
+
+### 5. TDD: no saltarse el rojo
+* El rojo **demuestra que el test es capaz de fallar**. Si se escribe el arreglo antes y el test pasa a la primera, no se sabe si pasa porque el arreglo funciona o porque el test está mal escrito (sin `static_cast<void>`, entrada equivocada...).
+* **Recuperar el rojo** cuando ya existe el arreglo: desactivarlo temporalmente, comprobar que los tests fallan, y restaurarlo.
+  * Ojo con `-Werror`: comentar los dos `if` dejaría `ptr` y `ec` sin usar → no compila. Truco: sustituirlos por `static_cast<void>(ec);` temporal.
+* Mensaje de GoogleTest cuando no se lanza nada:
+  ```
+  Expected: static_cast<void>(btclient::decode("ie")) throws an exception of type btclient::DecodeError.
+    Actual: it throws nothing.
+  ```
+
+### 6. Editar a la vez que otro (VS Code pisa cambios)
+* Si un archivo está abierto en VS Code con una versión antigua y se modifica en disco por otra vía, **al guardar desde VS Code se sobrescriben** los cambios del disco (pasó con `main.cpp` y con los espacios de `btclient:: Value`).
+* Solución: antes de seguir editando, `Ctrl+Shift+P` → **File: Revert File** para cargar la versión del disco.
+
+### 7. Siguiente: ronda 2
+* `RejectsNonDigitCharacters` (`i4x2e`): `from_chars` lee el `4` y para en la `x` **sin error** → hay que comprobar que `ptr` llegó al final de `digits` (`ptr != digits.data() + digits.size()` → `DecodeError`). **Test primero.**
