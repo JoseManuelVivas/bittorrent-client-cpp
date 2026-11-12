@@ -217,3 +217,24 @@ TEST(ValueEquality, DictKeyOrderMatters) {
 
     EXPECT_NE(a, b);
 }
+
+TEST(DecodeInteger, DecodesPositiveInteger) {
+    btclient::Value a{42};
+    btclient::Value b = btclient::decode("i42e");
+
+    EXPECT_EQ(a, b);
+}
+
+TEST(DecodeInteger, DecodesZero) {
+    btclient::Value a{0};
+    btclient::Value b = btclient::decode("i0e");
+
+    EXPECT_EQ(a, b);
+}
+
+TEST(DecodeInteger, DecodesNegativeInteger) {
+    btclient::Value a{-7};
+    btclient::Value b = btclient::decode("i-7e");
+
+    EXPECT_EQ(a, b);
+}
