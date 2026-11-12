@@ -1478,4 +1478,208 @@ public:
 ### 13. Estado y siguientes pasos
 1. ✅ Tests de `Value` (`find` e igualdad): 18 tests.
 2. ✅ Firma del decoder: `std::string_view` → `Value`, errores con `DecodeError` (declarados en `bencode.h`).
-3. ⬜ Paso 1 del decoder: enteros correctos (`i42e`, `i0e`, `i-7e`), con los tests primero.
+3. ✅ Paso 1 del decoder: enteros correctos (`i42e`, `i0e`, `i-7e`), con los tests primero. *(Ver entrada siguiente.)*
+
+---
+
+## [2026-11-12] Decoder, paso 1: enteros correctos
+
+### 1. La especificación de bencode
+* **Oficial:** BEP 3, sección *"bencoding"* (`https://www.bittorrent.org/beps/bep_0003.html`). Muy corta, en lenguaje natural, sin gramática formal (no es como un RFC).
+  * Strings: longitud en base 10 + `:` + bytes.
+  * Enteros: `i` + número en base 10 + `e`; pueden ser negativos. **Sin límite de tamaño**. `i-0e` inválido. Ceros a la izquierda inválidos (`i03e`), salvo `i0e`.
+  * Listas: `l` + elementos + `e`. Diccionarios: `d` + pares + `e`; claves **strings**, **ordenadas como strings en bruto** (bytes), no alfanuméricamente.
+* **Huecos que decide cada implementación** (documentar las decisiones propias):
+  * "Sin límite" en enteros → en la práctica 64 bits: `std::int64_t`; si no cabe, `DecodeError`.
+  * Ceros a la izquierda en la **longitud** de un string (`04:spam`): no se menciona; muchas implementaciones lo rechazan (una sola codificación por valor).
+  * Claves repetidas: no se dice explícitamente; "ordenadas" suele leerse como estrictamente ordenadas.
+  * Límite de anidamiento: no se menciona; decisión de seguridad.
+* **Otras fuentes:** *BitTorrentSpecification* de wiki.theory.org (no oficial, más detallada; si contradice al BEP, manda el BEP) y el código de clientes reales (decodificador de libtorrent, el motor de qBittorrent).
+* Hábito: ante una duda, ir primero al BEP; apuntar qué dice y qué se ha decidido en lo que no dice.
+
+### 2. Nombres de suites y tests
+* **Una suite por tipo:** `DecodeInteger`, `DecodeString`, `DecodeList`, `DecodeDict`, y `Decode` para lo general (entrada vacía, basura al final, profundidad). Permite filtrar: `--gtest_filter='DecodeInteger.*'`.
+* **Verbos:** `Decodes...` para lo que debe funcionar; `Rejects...` para lo que debe lanzar `DecodeError`.
+* **Sin guiones bajos** en nombres de suites ni tests: la macro `TEST` genera una clase uniéndolos con `_` (`DecodeInteger_DecodesPositiveInteger_Test`), y podrían chocar. *PascalCase*.
+* **Probar los bordes:** los fallos se esconden justo en el límite. Comprobar los dos lados de la frontera: `DecodesMaxInt64` (`i9223372036854775807e`) y `RejectsOverflow` (`i9223372036854775808e`). `std::numeric_limits<std::int64_t>::max()`/`min()` (`<limits>`) dan los extremos sin escribirlos a mano.
+* El cero merece test propio (`DecodesZero`): es el caso especial de la regla de los ceros a la izquierda.
+
+### 3. El rojo: error del enlazador
+```
+/usr/bin/x86_64-linux-gnu-ld.bfd: ... in function `DecodeInteger_DecodesPositiveInteger_Test::TestBody()':
+undefined reference to `btclient::decode(std::basic_string_view<char, std::char_traits<char> >)'
+collect2: error: ld returned 1 exit status
+```
+* Error del **enlazador** (`ld`, `collect2`), no del compilador: los tests **compilan** (sintaxis correcta, `decode` bien declarada en el header), pero al juntar los `.o` no existe el **código** de `decode`. Es el rojo esperado en TDD cuando se declara antes de implementar.
+* `std::basic_string_view<char, std::char_traits<char>>` es el nombre completo de `std::string_view`.
+* **Tests vacíos = verde falso:** un `TEST` sin comprobaciones pasa siempre. En TDD el test lleva su comprobación desde el principio.
+
+### 4. Estructura del decoder: funciones auxiliares
+```
+decode(input)                ← pública: mira el primer byte y decide
+ ├─ 'i'      → decode_integer
+ ├─ '0'-'9'  → decode_string
+ ├─ 'l'      → decode_list
+ └─ 'd'      → decode_dict
+```
+* `decode` es la "centralita"; cada auxiliar sabe leer **un solo tipo** (pequeñas y fáciles de cambiar). En el paso 1 solo existe `decode_integer` y `decode` la llama directamente.
+* **Auxiliares privadas:** solo en `bencode.cpp` (no en el header), dentro de un **namespace anónimo**. Los tests solo usan `decode`, así que reorganizarlas no rompe los tests.
+* **Deben ir antes que `decode`** en el archivo: el compilador lee de arriba abajo y tiene que conocerlas antes de verlas usadas.
+* **Posición compartida:** las auxiliares reciben `std::size_t& pos` (referencia **no** constante: la avanzan). Al entrar apunta al inicio del valor; al salir, justo después. Necesario para las listas (`li1ei2ee`: cada elemento empieza donde terminó el anterior) y para detectar basura al final (`pos == input.size()`). Añadirla ya, sabiendo que hará falta, evita rehacer la función en el paso 4.
+* **Nombres:** `snake_case` como `find`/`decode` → `decode_integer` (o `parse_integer`).
+
+### 5. Namespace anónimo y enlace
+* Cada `.cpp` se compila **por separado** a un `.o`; el **enlazador** los junta. Por defecto, cada función definida en un `.cpp` es **visible para todos** (así `main.cpp` usa `find`).
+* **Problema:** dos auxiliares con el mismo nombre en dos `.cpp` → `multiple definition of ...`, o comportamiento indefinido si las firmas difieren (violación de la **ODR**, *One Definition Rule*). Y ninguna debía ser pública.
+* **Solución:** todo lo que va dentro de `namespace { ... }` es **privado de ese `.cpp`** (**enlace interno** frente a **externo**). Equivale al `static` de C (`static int f(...)`); en C++ se prefiere el namespace anónimo (vale para funciones, variables y clases).
+* **Ventajas:** encapsulación (como `private:` a nivel de archivo) y el compilador avisa si una auxiliar queda sin usar (`-Wunused-function`) y optimiza mejor.
+* Puede ir **dentro** de `btclient` para que las auxiliares usen `Value` sin `btclient::`.
+
+### 6. Devolver `Value`, no `const Value`
+* `find` devuelve `const Value*`: puntero a datos **de otro** (dentro del diccionario de quien llama) → el `const` protege de verdad.
+* `decode_integer` devuelve un `Value` **nuevo y propio** → `const` no protege nada (se puede copiar a una variable normal) y **rompe la move semantics**: mover es "robar" los datos internos, lo que exige modificar el origen; un objeto `const` no se puede mover y se **copia**. En `decode_list` (`elements.push_back(decode_value(...))`) supondría copiar cada subárbol en cada nivel.
+* **Regla:** devolver por valor → sin `const` (C++ Core Guidelines). Puntero/referencia a datos ajenos → `const` si no deben modificarse. Igual en parámetros: `const Value& dictionary` (no es tuyo) vs `std::size_t& pos` (se modifica a propósito). La pregunta de siempre: **¿de quién es y quién puede modificarlo?**
+
+### 7. `std::size_t`
+* Entero **sin signo** para **tamaños y posiciones** en memoria (`<cstddef>`). En 64 bits: 8 bytes, de 0 a 2⁶⁴ − 1. Lo devuelven `.size()`, `sizeof`, `.find()`; se usa en índices `[ ]`.
+* Mejor que `int` (32 bits con signo, ~2.100 millones; un tamaño negativo no tiene sentido).
+* **Trampas:**
+  1. Restar por debajo de 0 **da la vuelta**: `std::size_t a = 0; a - 1` → 18446744073709551615. En un parser, `final - inicio` al revés da una longitud gigantesca → lectura fuera del buffer.
+  2. Mezclarlo con `int` → `-Wsign-conversion` (error con `-Werror`).
+  3. **`npos`:** `find` devuelve `std::string_view::npos` (el máximo de `std::size_t`) si **no encuentra**. Es un **valor centinela**, como el `nullptr` de `find`. **Comprobarlo siempre** antes de usar la posición.
+
+| Expresión | Qué es | Tipo |
+|---|---|---|
+| `pos` | por dónde se va | `std::size_t` |
+| `input.size()` | cuántos bytes hay | `std::size_t` |
+| `input.find('e', pos)` | dónde está la `e` (o `npos`) | `std::size_t` |
+| `input[pos]` | el carácter en esa posición | `char` (`const char&`) |
+| `'i'`, `'e'`, `'-'`, `'0'` | caracteres literales | `char` |
+| `input.substr(...)` | un trozo del input | `std::string_view` |
+* `pos` **no es un carácter**, es una posición; el carácter es `input[pos]`. Comparar `char` con `char` (`input[pos] == 'i'`) es seguro.
+* **Antes de `input[pos]`, comprobar `pos < input.size()`**: si no, se lee fuera del buffer (UB; ASan lo caza). Casos `""` e `"i"` para el paso 2.
+
+### 8. Errores en las auxiliares
+* Un entero inválido **no devuelve nada**: `throw DecodeError("unterminated integer");`. La función termina ahí; no hace falta `return` después (el compilador lo sabe y no avisa de *"control reaches end of non-void function"*).
+* Mensajes concretos: `"unterminated integer"`, `"invalid integer: leading zero"`, `"negative zero is not allowed"`... Es lo que mostrará `e.what()`.
+
+### 9. Includes: en el `.cpp` o en el `.h`
+* **Cada include en el archivo que lo necesita.** `<charconv>` (`std::from_chars`) solo se usa en la implementación → `bencode.cpp`.
+* El header solo incluye lo necesario para **entender sus declaraciones** (`<variant>`, `<string>`, `<vector>`, `<string_view>`, `<stdexcept>`).
+* Todo lo incluido en un header **se arrastra** a cada archivo que lo incluye: compilación más lenta y detalles internos expuestos.
+
+### 10. Aprender la API sin memorizarla
+* Nadie se sabe todas las funciones de la librería estándar. La lógica es lo difícil; la sintaxis es **vocabulario** que se aprende usándolo.
+* **Método:**
+  1. Escribir primero la lógica en comentarios; luego traducir línea a línea ("¿cómo se busca un carácter en un `string_view`?" es fácil de buscar).
+  2. **cppreference.com**: cada tipo tiene la lista de funciones miembro con una línea por función.
+  3. **Autocompletado** de VS Code: `input.` muestra todas las funciones miembro.
+  4. Preguntar "¿cómo se hace X en C++?": la lógica sigue siendo propia.
+* **Ejercicio:** reescribir `decode_integer` desde cero mirando solo los pasos en comentarios.
+
+#### Chuleta
+**`std::string_view`:**
+
+| Quiero... | Se escribe |
+|---|---|
+| cuántos caracteres | `input.size()` |
+| ¿está vacío? | `input.empty()` |
+| carácter en una posición | `input[pos]` |
+| buscar un carácter desde una posición | `input.find('e', pos)` → posición o `npos` |
+| un trozo sin copiar | `input.substr(inicio, cuántos)` (**cuántos**, no hasta dónde) |
+| ¿empieza por algo? | `input.starts_with('i')` (C++20) |
+| puntero al primer carácter | `input.data()` |
+
+**`std::from_chars`** (`<charconv>`), texto a número:
+```cpp
+std::int64_t number{};
+auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), number);
+// ec == std::errc{}  → todo bien
+// ptr                → hasta dónde ha leído
+```
+* Recibe **dos punteros** (inicio y fin), no un `string_view`. Acepta el signo `-`. No lanza excepciones, no depende del *locale*. `auto [ptr, ec]` son *structured bindings*.
+
+**`std::vector`:**
+
+| Quiero... | Se escribe |
+|---|---|
+| añadir al final | `v.push_back(x)` / `v.emplace_back(...)` |
+| cuántos elementos | `v.size()` |
+| el último | `v.back()` |
+
+### 11. `decode_integer`
+```cpp
+// Decodes an integer of the form i<digits>e starting at `pos`, which must
+// point at the 'i'. On return, `pos` points just past the closing 'e'.
+Value decode_integer(std::string_view input, std::size_t& pos) {
+    ++pos;  // skip 'i'
+
+    const std::size_t end = input.find('e', pos);
+    if (end == std::string_view::npos) {
+        throw DecodeError("unterminated integer");
+    }
+
+    const std::string_view digits = input.substr(pos, end - pos);
+    std::int64_t number{};
+    std::from_chars(digits.data(), digits.data() + digits.size(), number);
+
+    pos = end + 1;  // continue after 'e'
+    return Value{number};
+}
+
+Value decode(std::string_view input) {
+    std::size_t pos = 0;
+    return decode_integer(input, pos);
+}
+```
+```
+input:  i  4  2  e
+index:  0  1  2  3
+```
+1. `++pos` → salta la `i` (pos = 1). Con `std::size_t`, `++pos` y `pos++` son iguales; por costumbre se prefiere la forma prefija (evita una copia con iteradores complejos).
+2. `find('e', pos)` → 3.
+3. Sin `e` → `npos` → `DecodeError`. Sin esta comprobación, `input.data() + npos` apuntaría absurdamente lejos (UB).
+4. `substr(pos, end - pos)` → desde 1, 2 caracteres → `"42"`, sin copia.
+5. `from_chars` → 42 (de momento se ignora lo que devuelve; en el paso 2 detectará `i4x2e` y overflow).
+6. `pos = end + 1` → justo después de la `e` (4).
+7. `return Value{number};`
+* `number{}` inicializa a 0. El comentario de arriba documenta el **contrato** de `pos` (dónde está al entrar y al salir), que necesitarán las listas.
+
+#### Fallos del primer intento sin mirar
+1. **`substr(pos, end)`**: el segundo argumento es la **cantidad**, no la posición final → `"42e"`. Correcto: `substr(pos, end - pos)`.
+2. **Variable sin usar:** `digits` calculada pero el `from_chars` usaba `input.data() + pos` / `+ end` (correcto, otra forma) → `-Wall` avisa y `-Werror` no compila. Elegir una de las dos.
+3. **`std::from_chars(digits, number)`** no existe: necesita dos punteros.
+4. **Sin comprobación de `npos`.**
+5. **`pos` sin avanzar tras la `e`**: los tres tests pasaban igual (solo comprueban el `Value`), pero rompería las listas y la detección de basura al final. **Lección de TDD: que los tests pasen solo garantiza que no hay bugs en lo que comprueban.** Lo cazarán los tests de listas y de `i42eXYZ`.
+6. Detalles: `const` en `end`/`digits`, comentarios en inglés explicando el porqué (`// skip 'i'`), sangría de 4.
+
+### 12. Tests de errores: `EXPECT_THROW` y `[[nodiscard]]`
+```cpp
+TEST(DecodeInteger, RejectsMissingTerminator) {
+    EXPECT_THROW(static_cast<void>(btclient::decode("i7")), btclient::DecodeError);
+}
+```
+* **`btclient::DecodeError`**: el tipo está en el namespace, igual que `decode`.
+* **Choque con `[[nodiscard]]`:** `EXPECT_THROW` llama a `decode` y descarta el `Value` (solo le importa si lanza) → *"ignoring return value of ... declared with attribute 'nodiscard' [-Werror=unused-result]"*. Es el `[[nodiscard]]` funcionando como debe.
+* **Solución:** `static_cast<void>(...)` evalúa la expresión (`decode` se ejecuta y puede lanzar) y descarta el resultado de forma explícita. Usarlo en todos los `Rejects...`.
+
+### 13. Paso 2: tests de enteros inválidos
+| Test | Entrada | Regla |
+|---|---|---|
+| `RejectsMissingTerminator` | `i42` | falta la `e` (ya pasa, por el `npos`) |
+| `RejectsEmptyInteger` | `ie` | sin dígitos |
+| `RejectsLoneMinusSign` | `i-e` | `-` sin dígitos |
+| `RejectsNonDigitCharacters` | `i4x2e` | caracteres no numéricos |
+| `RejectsPlusSign` | `i+5e` | `+` no permitido |
+| `RejectsNegativeZero` | `i-0e` | prohibido por el BEP 3 |
+| `RejectsLeadingZeros` | `i03e` | ceros a la izquierda |
+| `RejectsNegativeLeadingZeros` | `i-03e` | ídem con negativo |
+| `RejectsOverflow` | `i9223372036854775808e` | no cabe en `std::int64_t` |
+| `DecodesMaxInt64` | `i9223372036854775807e` | máximo válido |
+| `DecodesMinInt64` | `i-9223372036854775808e` | mínimo válido |
+* **Orden:** (1) `RejectsMissingTerminator`; (2) vacío, `-` solo, no dígitos, `+` y overflow → casi todos con lo que devuelve `from_chars` (`ec` y si `ptr` llegó al final); (3) los extremos válidos (deberían pasar ya); (4) `-0` y ceros a la izquierda → `from_chars` **los acepta** (`03` es 3): necesitan una comprobación propia de los primeros caracteres.
+* Escribir los tests y ejecutarlos **antes** de tocar `decode_integer` para ver exactamente cuáles fallan.
+
+### 14. Estado y siguientes pasos
+1. ✅ Paso 1: `decode_integer` + `decode`; 3 tests `DecodeInteger` (21 en total) en verde.
+2. ⬜ Paso 2: tests `Rejects...` y extremos, validaciones en `decode_integer`.
