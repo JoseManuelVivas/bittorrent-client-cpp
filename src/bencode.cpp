@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <system_error>
 
 namespace btclient {
     const Value* find(const Value& dictionary, std::string_view key) {
@@ -31,7 +32,14 @@ namespace btclient {
 
             const std::string_view digits = input.substr(pos, end - pos);
             std::int64_t number{};
-            std::from_chars(digits.data(), digits.data() + digits.size(), number);
+            const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), number);
+
+            if (ec == std::errc::result_out_of_range) {
+                throw DecodeError("integer out of range");
+            }
+            if (ec != std::errc{}) {
+                throw DecodeError("invalid integer");
+            }
 
             pos = end + 1;  // continue after 'e'
             return Value{number};

@@ -238,3 +238,25 @@ TEST(DecodeInteger, DecodesNegativeInteger) {
 
     EXPECT_EQ(a, b);
 }
+
+TEST(DecodeInteger, RejectsMissingTerminator) {
+    EXPECT_THROW(static_cast<void>(btclient::decode("i7")), btclient::DecodeError);
+}
+
+TEST(DecodeInteger, RejectsEmptyInteger) {
+    EXPECT_THROW(static_cast<void>(btclient::decode("ie")), btclient::DecodeError);
+}
+
+TEST(DecodeInteger, RejectsLoneMinusSign) {
+    EXPECT_THROW(static_cast<void>(btclient::decode("i-e")), btclient::DecodeError);
+}
+
+TEST(DecodeInteger, RejectsPlusSign) {
+    EXPECT_THROW(static_cast<void>(btclient::decode("i+5e")), btclient::DecodeError);
+}
+
+// One past the maximum value of std::int64_t (9223372036854775807).
+TEST(DecodeInteger, RejectsOverflow) {
+    EXPECT_THROW(static_cast<void>(btclient::decode("i9223372036854775808e")),
+                 btclient::DecodeError);
+}
